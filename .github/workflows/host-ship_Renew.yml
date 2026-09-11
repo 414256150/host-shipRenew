@@ -2,8 +2,8 @@ name: Host Ship Auto Renew
 
 on:
   schedule:
-    # 每周四 UTC 22:00（北京时间次日 06:00）运行，可根据你的 30 天周期调整
-    - cron: '0 22 * * 4'
+    # 每月1日 UTC 22:22（北京时间次日 06:22）运行
+    - cron: '22 22 1 * *'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
