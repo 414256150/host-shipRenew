@@ -1,4 +1,4 @@
-name: Host-Ship 续期
+name: Host-Ship renew
 
 on:
   schedule:
