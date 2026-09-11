@@ -1,69 +1,64 @@
-name: Host-Ship renew
+name: Host Ship Auto Renew
 
 on:
   schedule:
-    - cron: '0 22 * * 4'    # 每周四 22:00 (UTC时间) 触发一次，北京时间6:00，即每 7 天运行一次
-  workflow_dispatch:
-
-permissions:
-  actions: write
-  contents: read
+    # 每周四 UTC 22:00（北京时间次日 06:00）运行，可根据你的 30 天周期调整
+    - cron: '0 22 * * 4'
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
-  renew-run:
-    name: 自动化续期节点
+  Renew-HostShip:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
 
     steps:
-      - name: 拉取仓库
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: 配置 Python 环境
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+    - name: ⚙ 设置 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-      - name: 安装系统底层依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb curl
-          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i /tmp/chrome.deb || sudo apt-get install -f -y
+    - name: 🛠️ 安装系统依赖和 Python 依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+        pip install seleniumbase requests
+        seleniumbase install chromedriver
 
-      - name: 安装 Python 依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install DrissionPage xvfbwrapper requests
+    - name: ⚙ 设置代理 (sing-box，可选)
+      continue-on-error: true
+      env:
+        NODE_LINK: ${{ secrets.NODE_LINK }}
+      run: |
+        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 启用 WARP 网络 (防止面板阻断 GitHub IP)
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
+    - name: 🚀 运行续期脚本
+      env:
+        HOSTSHIP_EMAIL: ${{ secrets.HOSTSHIP_EMAIL }}
+        HOSTSHIP_PASSWORD: ${{ secrets.HOSTSHIP_PASSWORD }}
+        HOSTSHIP_SERVER_ID: ${{ secrets.HOSTSHIP_SERVER_ID }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        IS_PROXY: ${{ secrets.IS_PROXY || 'false' }}
+        PROXY_SERVER: ${{ secrets.PROXY_SERVER || 'http://127.0.0.1:1081' }}
+      run: |
+        xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+          python3 app.py
 
-      - name: 执行 Host-Ship 自动续签
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PANEL_USER: ${{ secrets.PANEL_USER }}
-          PANEL_PASS: ${{ secrets.PANEL_PASS }}
-        run: python -u main.py
-
-      - name: 归档运行截图
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hostship-screenshots-${{ github.run_number }}
-          path: output/screenshots/*.png
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: 自动清理历史工作流记录
-        if: always()
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          delete_workflow_pattern: ${{ github.workflow }}
-          retain_days: 0
-          keep_minimum_runs: 2
+    - name: 🧹 清理旧的工作流运行记录
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+        count=0
+        for run_id in $runs; do
+          count=$((count + 1))
+          if [ $count -gt 1 ]; then
+            echo "删除运行记录: $run_id"
+            gh run delete $run_id || true
+          fi
+        done
