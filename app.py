@@ -46,7 +46,7 @@ def send_tg_message(status_icon, status_text, extra=""):
         masked_username = USERNAME
 
     text = (
-        f"🚢 Host Ship 续期通知\n\n"
+        f"🚢 Host Ship 续期通知(30天续期，每次10天)\n\n"
         f"{status_icon} {status_text}\n"
         f"👤 账户: {masked_username}\n"
         f"⏱️ 时间: {current_time_str}"
