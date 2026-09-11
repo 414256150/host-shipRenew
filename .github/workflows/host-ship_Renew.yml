@@ -37,7 +37,7 @@ jobs:
 
     - name: 🚀 运行续期脚本
       env:
-        HOSTSHIP_EMAIL: ${{ secrets.HOSTSHIP_EMAIL }}
+        HOSTSHIP_USERNAME: ${{ secrets.HOSTSHIP_USERNAME }}
         HOSTSHIP_PASSWORD: ${{ secrets.HOSTSHIP_PASSWORD }}
         HOSTSHIP_SERVER_ID: ${{ secrets.HOSTSHIP_SERVER_ID }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
