@@ -10,7 +10,6 @@ from seleniumbase import SB
 # 从环境变量获取账号密码和 TG 配置
 EMAIL        = os.environ.get("HOSTSHIP_EMAIL") or ""
 PASSWORD     = os.environ.get("HOSTSHIP_PASSWORD") or ""
-SERVER_ID    = os.environ.get("HOSTSHIP_SERVER_ID") or ""   # 例如 7e97dcac（不含#）
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
@@ -35,7 +34,6 @@ def send_tg_message(status_icon, status_text, extra=""):
         f"🚢 Host Ship 续期通知\n\n"
         f"{status_icon} {status_text}\n"
         f"👤 账户: {masked_email}\n"
-        f"🖥️ 服务器: #{SERVER_ID}\n"
         f"⏱️ 时间: {current_time_str}"
     )
     if extra:
@@ -210,7 +208,6 @@ def login(sb) -> bool:
 
     print("🖱️ 提交登录...")
     try:
-        # 优先找提交按钮
         submit = None
         for sel in ['button[type="submit"]', 'button.btn-primary', 'button']:
             try:
@@ -250,35 +247,68 @@ def login(sb) -> bool:
 
 # ===================== 续期流程 =====================
 def go_to_server(sb) -> bool:
-    if not SERVER_ID:
-        print("❌ 未设置 HOSTSHIP_SERVER_ID")
-        return False
-
-    target = f"{BASE_URL}/server/{SERVER_ID}"
-    print(f"🖥️ 进入服务器页面: {target}")
-    sb.uc_open_with_reconnect(target, reconnect_time=6)
-    time.sleep(6)
-
+    """从 Dashboard 自动进入第一个服务器管理页"""
+    print("🖥️ 确保在 Dashboard 页面...")
     cur = sb.get_current_url().lower()
-    if SERVER_ID.lower() not in cur:
-        # 尝试从 Dashboard 点击
-        print("⚠️ 直接访问失败，尝试从 Dashboard 进入...")
+    if "/server/" not in cur:
         sb.open(BASE_URL)
         time.sleep(5)
-        try:
-            # 截图中服务器卡片有 "MANAGE SERVER" 按钮
-            for a in sb.find_elements("a, button"):
-                href = (a.get_attribute("href") or "").lower()
-                txt = (a.text or "").lower()
-                if SERVER_ID.lower() in href or "manage server" in txt or "console" in txt:
-                    a.click()
-                    time.sleep(5)
-                    break
-        except Exception as e:
-            print(f"从 Dashboard 跳转异常: {e}")
 
-    print(f"📄 当前页面: {sb.get_current_url()}")
-    return True
+    print("🔍 在 Dashboard 查找服务器并进入管理页...")
+    time.sleep(3)
+
+    # 优先找 "MANAGE SERVER" 按钮（截图中的灰色按钮）
+    manage_btn = None
+    try:
+        for el in sb.find_elements("button, a"):
+            txt = (el.text or "").strip().upper()
+            if "MANAGE SERVER" in txt or "管理服务器" in txt:
+                manage_btn = el
+                print(f"✅ 找到按钮: [{el.text.strip()}]")
+                break
+    except Exception:
+        pass
+
+    if manage_btn:
+        try:
+            sb.execute_script("arguments[0].scrollIntoView({block:'center'});", manage_btn)
+            time.sleep(0.5)
+            manage_btn.click()
+            time.sleep(5)
+            print(f"📄 已进入服务器页面: {sb.get_current_url()}")
+            return True
+        except Exception as e:
+            print(f"点击 MANAGE SERVER 失败: {e}")
+
+    # 备选：点击包含 /server/ 的链接或服务器卡片
+    try:
+        for a in sb.find_elements("a"):
+            href = (a.get_attribute("href") or "").lower()
+            if "/server/" in href and "create" not in href:
+                print(f"✅ 找到服务器链接: {href}")
+                a.click()
+                time.sleep(5)
+                print(f"📄 已进入服务器页面: {sb.get_current_url()}")
+                return True
+    except Exception as e:
+        print(f"查找服务器链接异常: {e}")
+
+    # 再备选：点击服务器名称区域
+    try:
+        for el in sb.find_elements("div, span, h1, h2, h3"):
+            txt = (el.text or "").lower()
+            if "server" in txt and ("online" in txt or "#" in txt):
+                el.click()
+                time.sleep(5)
+                if "/server/" in sb.get_current_url().lower():
+                    print(f"📄 已进入服务器页面: {sb.get_current_url()}")
+                    return True
+    except Exception:
+        pass
+
+    print("❌ 未能进入服务器管理页面")
+    sb.save_screenshot("go_to_server_fail.png")
+    return False
 
 def do_renew(sb):
     print("\n" + "#" * 30)
@@ -291,7 +321,7 @@ def do_renew(sb):
 
     time.sleep(3)
 
-    # 查找续期相关按钮（根据截图：右侧有 Renew / Renew Limit Reached）
+    # 查找续期相关按钮（截图右侧：Renew / Renew Limit Reached）
     print("🔄 查找续期按钮...")
     renew_btn = None
     candidates = []
@@ -308,7 +338,6 @@ def do_renew(sb):
         print(f"查找按钮异常: {e}")
 
     for el, txt in candidates:
-        # 优先真正的可点击续期按钮
         if "limit reached" in txt or "已达上限" in txt or "无法续期" in txt:
             print(f"ℹ️ 当前显示「{txt}」，可能未到续期窗口")
             send_tg_message("⏳", "未到续期时间 / 已达上限", txt)
@@ -323,7 +352,6 @@ def do_renew(sb):
 
     if not renew_btn:
         print("❌ 未找到任何续期相关按钮")
-        # 打印右侧面板信息帮助调试
         try:
             page = sb.get_page_source() or ""
             if "renewal" in page.lower() or "renew" in page.lower():
@@ -344,10 +372,9 @@ def do_renew(sb):
 
     time.sleep(5)
 
-    # 可能弹出确认框 / 验证码
+    # 可能弹出确认框
     print("⏳ 检查是否有确认弹窗或验证...")
     try:
-        # 尝试点击确认类按钮
         for btn in sb.find_elements("button"):
             t = (btn.text or "").lower()
             if any(k in t for k in ["confirm", "yes", "ok", "renew", "确认", "续期"]):
@@ -358,7 +385,7 @@ def do_renew(sb):
     except Exception:
         pass
 
-    # 再次检查 Turnstile（有些面板续期也有盾）
+    # 再次检查 Turnstile
     if sb.execute_script(_EXISTS_JS):
         print("检测到续期页 Turnstile，尝试处理...")
         handle_turnstile(sb)
@@ -397,9 +424,6 @@ def main():
 
     if not EMAIL or not PASSWORD:
         print("❌ 请设置 HOSTSHIP_EMAIL 和 HOSTSHIP_PASSWORD")
-        return
-    if not SERVER_ID:
-        print("❌ 请设置 HOSTSHIP_SERVER_ID（例如 7e97dcac）")
         return
 
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
