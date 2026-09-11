@@ -45,8 +45,8 @@ RENEW_URLS = [
 |------------|------|------|------|
 | `TG_BOT_TOKEN` | ❌ | Telegram Bot Token | `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` |
 | `TG_CHAT_ID` | ❌ | 接收消息的 Chat ID | `123456789` |
-| HOSTSHIP_USERNAME | ❌ | 登录账号
-| HOSTSHIP_PASSWORD | ❌ | 登录密码
+| HOSTSHIP_USERNAME | ✅ | 登录账号
+| HOSTSHIP_PASSWORD | ✅ | 登录密码
 | PROXY_SERVER | ❌ | 代理
 
 > 不配置这两个 Secret 时，脚本仍会正常运行，只是不会发送 Telegram 通知。
