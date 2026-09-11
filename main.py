@@ -140,7 +140,7 @@ def main():
 
             # 步骤 3: 查找侧边栏的 Renew 按钮
             log(f"查找 {server_name} 的 Renew 按钮...")
-            renew_btn = next((el for el in page.eles('tag:button') if el.text and el.text.strip().lower() == 'renew'), None)
+            renew_btn = next((el for el in page.eles('tag:button') if el.text and el.text.strip().lower() == 'renew limit reached'), None)
             
             if not renew_btn:
                 log(f"{server_name} 未找到 Renew 按钮，可能时间未到或已被风控", "WARN")
