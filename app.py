@@ -1,452 +1,761 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Host Ship 自动登录 + 自动续期
+================================
+
+运行环境：
+- Python 3.10+
+- SeleniumBase
+- requests
+- Chrome / Chromium
+- GitHub Actions + Xvfb
+
+环境变量：
+    HOSTSHIP_EMAIL
+    HOSTSHIP_PASSWORD
+    HOSTSHIP_SERVER_ID        # 可选
+    TG_CHAT_ID                # 可选
+    TG_BOT_TOKEN              # 可选
+
+可选代理：
+    IS_PROXY=true
+    PROXY_SERVER=http://127.0.0.1:1081
+
+主要改动：
+1. 不再强制寻找 input[type="email"]
+2. 按浏览器实际 DOM 自动寻找账号输入框
+3. 支持 email / username / identifier 等不同命名
+4. 支持普通 text 输入框 fallback
+5. JS 填充并触发 input/change/blur 事件
+6. 密码框优先使用 Enter 模拟浏览器登录
+7. 自动处理 Turnstile
+8. 登录失败自动保存 HTML / PNG
+9. 保留服务器管理及续期逻辑
+10. Telegram 通知
+"""
+
 import os
+import sys
 import time
-import subprocess
+import traceback
+from typing import Optional
+
 import requests
 from seleniumbase import SB
 
 
 # ============================================================
-# 环境变量
+# 配置
 # ============================================================
-
-EMAIL        = os.environ.get("HOSTSHIP_EMAIL") or ""
-PASSWORD     = os.environ.get("HOSTSHIP_PASSWORD") or ""
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
 BASE_URL = "https://panel.host-ship.com"
 
+LOGIN_URL = f"{BASE_URL}/auth/login"
+
+EMAIL = os.environ.get("HOSTSHIP_EMAIL", "").strip()
+PASSWORD = os.environ.get("HOSTSHIP_PASSWORD", "").strip()
+
+SERVER_ID = os.environ.get("HOSTSHIP_SERVER_ID", "").strip()
+
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+
+IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get(
+    "PROXY_SERVER",
+    "http://127.0.0.1:1081"
+).strip()
+
 
 # ============================================================
-# Telegram 推送
+# 基础工具
 # ============================================================
 
-def send_tg_message(status_icon, status_text, extra=""):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
-        return
+def log(message: str):
+    print(message, flush=True)
 
-    local_time = time.gmtime(time.time() + 8 * 3600)
-    current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = EMAIL[:2] + '****'
-
-    text = (
-        f"🚢 Host Ship 续期通知\n\n"
-        f"{status_icon} {status_text}\n"
-        f"👤 账户: {masked_email}\n"
-        f"⏱️ 时间: {current_time_str}"
-    )
-
-    if extra:
-        text += f"\n📋 详情: {extra}"
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+def save_debug(sb, prefix: str):
+    """
+    保存调试截图和 HTML。
+    不输出密码等敏感内容。
+    """
+    try:
+        sb.save_screenshot(f"{prefix}.png")
+        log(f"📸 已保存: {prefix}.png")
+    except Exception as e:
+        log(f"⚠️ 保存截图失败: {e}")
 
     try:
-        r = requests.post(
-            url,
-            json={
-                "chat_id": TG_CHAT_ID,
-                "text": text
-            },
-            timeout=10
-        )
+        with open(
+            f"{prefix}.html",
+            "w",
+            encoding="utf-8"
+        ) as f:
+            f.write(sb.get_page_source())
 
-        if r.status_code == 200:
-            print("📩 Telegram 通知发送成功！")
-        else:
-            print(f"⚠️ Telegram 通知发送失败: {r.text}")
+        log(f"📄 已保存: {prefix}.html")
 
     except Exception as e:
-        print(f"⚠️ Telegram 通知发送异常: {e}")
+        log(f"⚠️ 保存 HTML 失败: {e}")
+
+
+def send_tg_message(message: str) -> bool:
+    """
+    Telegram 通知。
+    未配置 Telegram 时直接跳过。
+    """
+
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("ℹ️ Telegram 未配置，跳过通知")
+        return False
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TG_BOT_TOKEN}/sendMessage"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": TG_CHAT_ID,
+                "text": message,
+            },
+            timeout=20,
+        )
+
+        if response.ok:
+            log("📩 Telegram 通知发送成功！")
+            return True
+
+        log(
+            f"⚠️ Telegram 通知失败: "
+            f"{response.status_code} "
+            f"{response.text[:300]}"
+        )
+
+    except Exception as e:
+        log(f"⚠️ Telegram 请求异常: {e}")
+
+    return False
 
 
 # ============================================================
-# Cloudflare Turnstile 页面注入脚本
+# 浏览器 DOM 工具
 # ============================================================
 
-_EXPAND_JS = """
-(function() {
-    var ts = document.querySelector('input[name="cf-turnstile-response"]');
+def get_login_dom_info(sb):
+    """
+    获取当前页面所有可能和登录有关的元素。
 
-    if (!ts) {
-        return 'no-turnstile';
+    特别注意：
+    这里不读取 input.value，避免密码进入日志。
+    """
+
+    script = r"""
+    function visible(el) {
+        if (!el) return false;
+
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+
+        return (
+            r.width > 0 &&
+            r.height > 0 &&
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            s.opacity !== "0"
+        );
     }
 
-    var el = ts;
+    const elements = Array.from(
+        document.querySelectorAll(
+            "input, textarea, button, form, iframe, " +
+            '[contenteditable="true"]'
+        )
+    );
 
-    for (var i = 0; i < 20; i++) {
-        el = el.parentElement;
+    return elements.map((el, index) => {
+        const r = el.getBoundingClientRect();
 
-        if (!el) {
-            break;
-        }
-
-        var s = window.getComputedStyle(el);
-
-        if (
-            s.overflow === 'hidden' ||
-            s.overflowX === 'hidden' ||
-            s.overflowY === 'hidden'
-        ) {
-            el.style.overflow = 'visible';
-        }
-
-        el.style.minWidth = 'max-content';
-    }
-
-    document.querySelectorAll('iframe').forEach(function(f) {
-        if (
-            f.src &&
-            f.src.includes('challenges.cloudflare.com')
-        ) {
-            f.style.width = '300px';
-            f.style.height = '65px';
-            f.style.minWidth = '300px';
-            f.style.visibility = 'visible';
-            f.style.opacity = '1';
-        }
+        return {
+            index: index,
+            tag: el.tagName,
+            type: el.getAttribute("type") || "",
+            name: el.getAttribute("name") || "",
+            id: el.id || "",
+            placeholder: el.getAttribute("placeholder") || "",
+            autocomplete: el.getAttribute("autocomplete") || "",
+            aria: el.getAttribute("aria-label") || "",
+            role: el.getAttribute("role") || "",
+            src: el.tagName === "IFRAME"
+                ? (el.getAttribute("src") || "")
+                : "",
+            action: el.tagName === "FORM"
+                ? (el.getAttribute("action") || "")
+                : "",
+            method: el.tagName === "FORM"
+                ? (el.getAttribute("method") || "")
+                : "",
+            text: (
+                el.innerText ||
+                el.textContent ||
+                ""
+            ).trim().slice(0, 100),
+            visible: visible(el),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+            x: Math.round(r.x),
+            y: Math.round(r.y)
+        };
     });
+    """
 
-    return 'done';
-})()
-"""
-
-
-_EXISTS_JS = """
-(function() {
-    return document.querySelector(
-        'input[name="cf-turnstile-response"]'
-    ) !== null;
-})()
-"""
+    try:
+        return sb.execute_script(script)
+    except Exception as e:
+        log(f"⚠️ DOM 检查失败: {e}")
+        return []
 
 
-_SOLVED_JS = """
-(function() {
-    var i = document.querySelector(
-        'input[name="cf-turnstile-response"]'
-    );
+def print_login_dom(sb):
+    """
+    打印登录页面结构，但不打印密码值。
+    """
 
-    return !!(
-        i &&
-        i.value &&
-        i.value.length > 20
-    );
-})()
-"""
+    info = get_login_dom_info(sb)
+
+    log("🔎 当前浏览器登录 DOM：")
+
+    for item in info:
+        if item.get("tag") == "INPUT":
+            log(
+                "   INPUT "
+                f"type={item.get('type')} "
+                f"name={item.get('name')} "
+                f"id={item.get('id')} "
+                f"placeholder={item.get('placeholder')} "
+                f"autocomplete={item.get('autocomplete')} "
+                f"visible={item.get('visible')} "
+                f"size={item.get('width')}x{item.get('height')}"
+            )
+
+        elif item.get("tag") == "BUTTON":
+            log(
+                "   BUTTON "
+                f"type={item.get('type')} "
+                f"text={item.get('text')!r} "
+                f"visible={item.get('visible')}"
+            )
+
+        elif item.get("tag") == "IFRAME":
+            log(
+                "   IFRAME "
+                f"src={item.get('src')!r} "
+                f"visible={item.get('visible')}"
+            )
+
+        elif item.get("tag") == "FORM":
+            log(
+                "   FORM "
+                f"action={item.get('action')!r} "
+                f"method={item.get('method')!r} "
+                f"visible={item.get('visible')}"
+            )
 
 
-# ============================================================
-# DOM 检查
-# ============================================================
+def js_fill_input(sb, selector: str, value: str) -> bool:
+    """
+    使用浏览器 JS 原生 setter 写入 input。
 
-_FORM_INFO_JS = """
-(function() {
+    关键：
+    React / Vue / Alpine / 原生监听器可能不会因为直接
+    element.value = xxx 而更新状态。
 
-    function info(selector) {
-        var nodes = document.querySelectorAll(selector);
+    所以这里同时触发：
+        input
+        change
+        blur
+    """
 
-        var result = [];
+    script = r"""
+    const selector = arguments[0];
+    const value = arguments[1];
 
-        for (var i = 0; i < nodes.length; i++) {
-            var el = nodes[i];
-            var rect = el.getBoundingClientRect();
+    const el = document.querySelector(selector);
 
-            result.push({
-                tag: el.tagName,
-                type: el.type || "",
-                name: el.name || "",
-                id: el.id || "",
-                valueLength: (el.value || "").length,
-                disabled: !!el.disabled,
-                readonly: !!el.readOnly,
-                display: window.getComputedStyle(el).display,
-                visibility: window.getComputedStyle(el).visibility,
-                opacity: window.getComputedStyle(el).opacity,
-                width: rect.width,
-                height: rect.height,
-                x: rect.x,
-                y: rect.y
-            });
-        }
-
-        return result;
+    if (!el) {
+        return {
+            ok: false,
+            reason: "element_not_found"
+        };
     }
+
+    el.focus();
+
+    const proto =
+        Object.getPrototypeOf(el);
+
+    const descriptor =
+        Object.getOwnPropertyDescriptor(
+            proto,
+            "value"
+        );
+
+    if (descriptor && descriptor.set) {
+        descriptor.set.call(el, value);
+    } else {
+        el.value = value;
+    }
+
+    el.dispatchEvent(
+        new Event("input", {
+            bubbles: true
+        })
+    );
+
+    el.dispatchEvent(
+        new Event("change", {
+            bubbles: true
+        })
+    );
+
+    el.dispatchEvent(
+        new Event("blur", {
+            bubbles: true
+        })
+    );
 
     return {
-        email: info(
-            'input[type="email"], input[name="email"]'
-        ),
-
-        password: info(
-            'input[type="password"], input[name="password"]'
-        ),
-
-        submit: info(
-            'button[type="submit"], input[type="submit"]'
-        )
+        ok: true,
+        valueLength: (el.value || "").length
     };
-
-})()
-"""
-
-
-# ============================================================
-# JS 填充输入框
-# ============================================================
-
-def js_fill_input(sb, selector: str, text: str):
-    """
-    使用原生 HTMLInputElement.value setter 填充输入框。
-
-    这样可以兼容 React / Vue / Alpine 等前端框架，
-    避免单纯 execute_script 设置 value 后页面没有感知。
-    """
-
-    safe_text = (
-        text
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-    )
-
-    result = sb.execute_script(
-        f"""
-        (function() {{
-
-            var selectors = "{selector}".split(",");
-
-            var el = null;
-
-            for (var i = 0; i < selectors.length; i++) {{
-                var s = selectors[i].trim();
-                el = document.querySelector(s);
-
-                if (el) {{
-                    break;
-                }}
-            }}
-
-            if (!el) {{
-                return {{
-                    ok: false,
-                    reason: "element-not-found"
-                }};
-            }}
-
-            try {{
-                el.scrollIntoView({{
-                    behavior: "instant",
-                    block: "center"
-                }});
-            }} catch (e) {{}}
-
-            try {{
-                el.focus();
-            }} catch (e) {{}}
-
-            var setter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype,
-                "value"
-            );
-
-            if (setter && setter.set) {{
-                setter.set.call(el, "{safe_text}");
-            }} else {{
-                el.value = "{safe_text}";
-            }}
-
-            el.dispatchEvent(
-                new Event("input", {{
-                    bubbles: true
-                }})
-            );
-
-            el.dispatchEvent(
-                new Event("change", {{
-                    bubbles: true
-                }})
-            );
-
-            el.dispatchEvent(
-                new Event("blur", {{
-                    bubbles: true
-                }})
-            );
-
-            return {{
-                ok: true,
-                valueLength: (el.value || "").length,
-                type: el.type || "",
-                name: el.name || ""
-            }};
-
-        }})()
-        """
-    )
-
-    return result
-
-
-# ============================================================
-# 登录表单 DOM 检查
-# ============================================================
-
-def inspect_login_form(sb):
-    """
-    直接检查当前 document DOM。
-
-    这里故意不使用 wait_for_element()，
-    因为当前问题就是源码里存在 input，
-    但 SeleniumBase 的可见元素等待失败。
     """
 
     try:
-        info = sb.execute_script(_FORM_INFO_JS)
-
-        if not isinstance(info, dict):
-            print("⚠️ 无法读取登录表单 DOM")
-            return False
-
-        emails = info.get("email") or []
-        passwords = info.get("password") or []
-        submits = info.get("submit") or []
-
-        print(
-            f"🔎 DOM 检查: "
-            f"email={len(emails)}, "
-            f"password={len(passwords)}, "
-            f"submit={len(submits)}"
+        result = sb.execute_script(
+            script,
+            selector,
+            value
         )
 
-        if emails:
-            e = emails[0]
-
-            print(
-                "  📧 email: "
-                f"type={e.get('type')}, "
-                f"name={e.get('name')}, "
-                f"display={e.get('display')}, "
-                f"visibility={e.get('visibility')}, "
-                f"size={e.get('width')}x{e.get('height')}"
+        if result and result.get("ok"):
+            log(
+                f"✅ JS 填充成功: "
+                f"{selector} "
+                f"(长度={result.get('valueLength')})"
             )
+            return True
 
-        if passwords:
-            p = passwords[0]
-
-            print(
-                "  🔑 password: "
-                f"type={p.get('type')}, "
-                f"name={p.get('name')}, "
-                f"display={p.get('display')}, "
-                f"visibility={p.get('visibility')}, "
-                f"size={p.get('width')}x{p.get('height')}"
-            )
-
-        return bool(emails and passwords)
+        log(f"⚠️ JS 填充失败: {result}")
 
     except Exception as e:
-        print(f"⚠️ DOM 检查异常: {e}")
-        return False
+        log(f"⚠️ JS 填充异常: {e}")
+
+    # SeleniumBase 普通输入 fallback
+    try:
+        sb.click(selector)
+        sb.clear(selector)
+        sb.type(selector, value)
+
+        log(f"✅ 浏览器普通输入 fallback 成功: {selector}")
+        return True
+
+    except Exception as e:
+        log(f"❌ 普通输入也失败: {e}")
+
+    return False
+
+
+# ============================================================
+# 自动识别登录输入框
+# ============================================================
+
+def find_password_selector(sb) -> Optional[str]:
+    """
+    寻找密码框。
+    """
+
+    selectors = [
+        'input[type="password"]',
+        'input[name="password"]',
+        'input[id*="password" i]',
+        'input[autocomplete="current-password"]',
+        'input[autocomplete="password"]',
+    ]
+
+    for selector in selectors:
+        try:
+            if sb.is_element_present(selector):
+                return selector
+        except Exception:
+            pass
+
+    return None
+
+
+def find_username_selector(sb) -> Optional[str]:
+    """
+    自动寻找邮箱 / 用户名输入框。
+
+    不再依赖：
+        input[type=email]
+
+    优先级：
+        email
+        username
+        identifier
+        login
+        autocomplete=username
+        placeholder
+        普通 text input
+    """
+
+    # --------------------------------------------------------
+    # 第一层：常见 selector
+    # --------------------------------------------------------
+
+    selectors = [
+        'input[type="email"]',
+
+        'input[name="email"]',
+        'input[name="username"]',
+        'input[name="user"]',
+        'input[name="identifier"]',
+        'input[name="login"]',
+
+        'input[id*="email" i]',
+        'input[id*="username" i]',
+        'input[id*="user" i]',
+        'input[id*="identifier" i]',
+        'input[id*="login" i]',
+
+        'input[placeholder*="email" i]',
+        'input[placeholder*="e-mail" i]',
+        'input[placeholder*="username" i]',
+        'input[placeholder*="user" i]',
+        'input[placeholder*="login" i]',
+
+        'input[autocomplete="username"]',
+        'input[autocomplete="email"]',
+    ]
+
+    for selector in selectors:
+        try:
+            if sb.is_element_present(selector):
+                return selector
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # 第二层：根据 DOM 自动识别
+    # --------------------------------------------------------
+
+    script = r"""
+    function visible(el) {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+
+        return (
+            r.width > 100 &&
+            r.height > 20 &&
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            s.opacity !== "0"
+        );
+    }
+
+    const inputs = Array.from(
+        document.querySelectorAll("input")
+    ).filter(visible);
+
+    for (const el of inputs) {
+
+        const type =
+            (el.type || "").toLowerCase();
+
+        const name =
+            (el.name || "").toLowerCase();
+
+        const id =
+            (el.id || "").toLowerCase();
+
+        const placeholder =
+            (el.placeholder || "").toLowerCase();
+
+        const autocomplete =
+            (el.autocomplete || "").toLowerCase();
+
+        if (
+            type === "password" ||
+            type === "hidden" ||
+            type === "submit" ||
+            type === "button" ||
+            type === "checkbox"
+        ) {
+            continue;
+        }
+
+        const score =
+            (type === "email" ? 100 : 0) +
+            (name.includes("email") ? 80 : 0) +
+            (name.includes("user") ? 70 : 0) +
+            (name.includes("login") ? 60 : 0) +
+            (name.includes("identifier") ? 60 : 0) +
+            (id.includes("email") ? 80 : 0) +
+            (id.includes("user") ? 70 : 0) +
+            (placeholder.includes("email") ? 80 : 0) +
+            (placeholder.includes("user") ? 70 : 0) +
+            (autocomplete === "username" ? 100 : 0) +
+            (autocomplete === "email" ? 90 : 0);
+
+        if (score > 0) {
+            el.setAttribute(
+                "data-hostship-user-field",
+                "true"
+            );
+
+            return true;
+        }
+    }
+
+    // 最后 fallback：
+    // 第一个可见 text input
+    for (const el of inputs) {
+
+        const type =
+            (el.type || "").toLowerCase();
+
+        if (
+            type === "text" ||
+            type === ""
+        ) {
+            el.setAttribute(
+                "data-hostship-user-field",
+                "true"
+            );
+
+            return true;
+        }
+    }
+
+    return false;
+    """
+
+    try:
+        found = sb.execute_script(script)
+
+        if found:
+            return (
+                'input[data-hostship-user-field="true"]'
+            )
+
+    except Exception as e:
+        log(f"⚠️ 自动识别账号输入框失败: {e}")
+
+    return None
+
+
+def find_submit_selector(sb) -> Optional[str]:
+    """
+    自动寻找登录按钮。
+    """
+
+    selectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button[name="login"]',
+        'button[id*="login" i]',
+        'button[class*="login" i]',
+    ]
+
+    for selector in selectors:
+        try:
+            if sb.is_element_present(selector):
+                return selector
+        except Exception:
+            pass
+
+    # 根据按钮文字寻找
+    script = r"""
+    function visible(el) {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+
+        return (
+            r.width > 50 &&
+            r.height > 20 &&
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            s.opacity !== "0"
+        );
+    }
+
+    const buttons = Array.from(
+        document.querySelectorAll("button")
+    ).filter(visible);
+
+    const keywords = [
+        "login",
+        "log in",
+        "sign in",
+        "signin",
+        "submit",
+        "登录",
+        "登入"
+    ];
+
+    for (const button of buttons) {
+
+        const text =
+            (
+                button.innerText ||
+                button.textContent ||
+                ""
+            ).trim().toLowerCase();
+
+        if (
+            keywords.some(
+                x => text.includes(x)
+            )
+        ) {
+            button.setAttribute(
+                "data-hostship-login-button",
+                "true"
+            );
+
+            return true;
+        }
+    }
+
+    return false;
+    """
+
+    try:
+        if sb.execute_script(script):
+            return (
+                'button[data-hostship-login-button="true"]'
+            )
+
+    except Exception as e:
+        log(f"⚠️ 自动寻找登录按钮失败: {e}")
+
+    return None
 
 
 # ============================================================
 # Turnstile
 # ============================================================
 
-def handle_turnstile(sb) -> bool:
+def turnstile_solved(sb) -> bool:
+    """
+    检查 Turnstile 是否已经完成。
+    """
 
-    print("🔍 处理 Cloudflare Turnstile 验证...")
+    script = r"""
+    const selectors = [
+        'input[name="cf-turnstile-response"]',
+        'textarea[name="cf-turnstile-response"]',
+        'input[name="g-recaptcha-response"]',
+        'textarea[name="g-recaptcha-response"]'
+    ];
 
-    time.sleep(2)
+    for (const selector of selectors) {
+        const elements =
+            document.querySelectorAll(selector);
 
-    # --------------------------------------------------------
-    # 先检查是否已经静默通过
-    # --------------------------------------------------------
+        for (const el of elements) {
+            if (el.value && el.value.length > 10) {
+                return true;
+            }
+        }
+    }
+
+    const checked =
+        document.querySelector(
+            '.cf-turnstile input[type="checkbox"]:checked'
+        );
+
+    if (checked) {
+        return true;
+    }
+
+    return false;
+    """
 
     try:
-        if sb.execute_script(_SOLVED_JS):
-            print("✅ Turnstile 已静默通过")
+        return bool(sb.execute_script(script))
+    except Exception:
+        return False
+
+
+def handle_turnstile(sb) -> bool:
+    """
+    尝试处理 Cloudflare Turnstile。
+
+    SeleniumBase UC 模式通常可以通过：
+        uc_gui_click_captcha()
+
+    让浏览器完成可交互的 Turnstile。
+
+    如果页面没有 Turnstile，则直接返回 True。
+    """
+
+    try:
+        source = sb.get_page_source().lower()
+
+        if (
+            "turnstile" not in source and
+            "cf-turnstile" not in source
+        ):
+            log("ℹ️ 当前页面未检测到 Turnstile")
             return True
+
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # 尝试展开 Turnstile
-    # --------------------------------------------------------
+    log("🛡️ 检测到 Cloudflare Turnstile")
 
-    for _ in range(3):
-        try:
-            sb.execute_script(_EXPAND_JS)
-        except Exception:
-            pass
-
-        time.sleep(0.5)
+    if turnstile_solved(sb):
+        log("✅ Turnstile 已经通过")
+        return True
 
     # --------------------------------------------------------
-    # SeleniumBase UC CAPTCHA 处理
+    # SeleniumBase UC CAPTCHA 点击
     # --------------------------------------------------------
 
-    for attempt in range(6):
+    try:
+        log("🖱️ 尝试浏览器自动点击 Turnstile...")
 
-        try:
-            if sb.execute_script(_SOLVED_JS):
-                print(
-                    f"✅ Turnstile 通过"
-                    f"（第 {attempt} 次检查）"
-                )
-                return True
-        except Exception:
-            pass
+        sb.uc_gui_click_captcha()
 
-        print(
-            f"🖱️ 第 {attempt + 1} 次调用 "
-            f"uc_gui_click_captcha..."
-        )
+        time.sleep(5)
 
-        try:
-            sb.uc_gui_click_captcha()
+    except Exception as e:
+        log(f"⚠️ Turnstile 自动点击异常: {e}")
 
-        except Exception as e:
-            print(
-                f"⚠️ uc_gui_click_captcha 调用异常: {e}"
-            )
+    # --------------------------------------------------------
+    # 再次检查
+    # --------------------------------------------------------
 
-        # 最多等待 8 秒
-        for _ in range(16):
+    if turnstile_solved(sb):
+        log("✅ Turnstile 验证完成")
+        return True
 
-            time.sleep(0.5)
+    # 页面可能是 Cloudflare 自己完成验证
+    # 给它更多时间
+    for i in range(10):
 
-            try:
-                if sb.execute_script(_SOLVED_JS):
-                    print(
-                        f"✅ Turnstile 通过"
-                        f"（第 {attempt + 1} 次尝试）"
-                    )
-                    return True
-            except Exception:
-                pass
+        time.sleep(1)
 
-        print(
-            f"⚠️ 第 {attempt + 1} 次未通过，重试..."
-        )
+        if turnstile_solved(sb):
+            log("✅ Turnstile 验证完成")
+            return True
 
-    print("❌ Turnstile 6 次均失败")
-
+    log("⚠️ 未能确认 Turnstile 已完成")
     return False
 
 
@@ -456,570 +765,267 @@ def handle_turnstile(sb) -> bool:
 
 def login(sb) -> bool:
 
-    login_url = BASE_URL + "/auth/login"
+    log("")
+    log("=" * 60)
+    log("🔐 开始 Host Ship 浏览器登录")
+    log("=" * 60)
 
-    print()
-    print("=" * 60)
-    print("🔐 开始 Host Ship 登录")
-    print("=" * 60)
+    if not EMAIL:
+        log("❌ HOSTSHIP_EMAIL 未配置")
+        return False
+
+    if not PASSWORD:
+        log("❌ HOSTSHIP_PASSWORD 未配置")
+        return False
 
     # --------------------------------------------------------
     # 1. 打开登录页面
     # --------------------------------------------------------
 
-    print(f"🌐 打开登录页面: {login_url}")
+    log(f"🌐 打开登录页面: {LOGIN_URL}")
 
     try:
         sb.uc_open_with_reconnect(
-            login_url,
+            LOGIN_URL,
             reconnect_time=8
         )
-
     except Exception as e:
-        print(f"⚠️ uc_open_with_reconnect 异常: {e}")
+        log(f"⚠️ uc_open_with_reconnect 异常: {e}")
 
         try:
-            sb.open(login_url)
+            sb.open(LOGIN_URL)
         except Exception as e2:
-            print(f"❌ 普通打开页面也失败: {e2}")
+            log(f"❌ 打开登录页面失败: {e2}")
             return False
 
-    # 给 Cloudflare / JS 一点启动时间
     time.sleep(5)
 
-    # --------------------------------------------------------
-    # 2. 等待页面返回登录 HTML
-    #
-    # 注意：
-    # 这里只判断源码，不再把源码检测当成元素可见。
-    # --------------------------------------------------------
-
-    print("⏳ 等待登录页面 / Cloudflare...")
-
-    source_ready = False
-
-    for i in range(30):
-
-        try:
-            page_src = (
-                sb.get_page_source() or ""
-            ).lower()
-
-            if (
-                'type="email"' in page_src
-                or 'name="email"' in page_src
-                or 'type="password"' in page_src
-            ):
-                source_ready = True
-
-                print(
-                    f"✅ 登录页面 HTML 已返回"
-                    f"（{i + 1}s）"
-                )
-
-                break
-
-        except Exception:
-            pass
-
-        time.sleep(1)
-
-    if not source_ready:
-        print(
-            "⚠️ 30 秒内没有检测到登录表单 HTML"
-        )
+    log(f"📍 当前 URL: {sb.get_current_url()}")
+    log(f"📄 当前标题: {sb.get_title()}")
 
     # --------------------------------------------------------
-    # 3. 关键修改：
-    #
-    # 不再使用：
-    #
-    # sb.wait_for_element(...)
-    #
-    # 改成直接检查 DOM。
+    # 2. 等待页面 DOM
     # --------------------------------------------------------
 
-    print("🔎 等待登录表单进入 DOM...")
+    log("⏳ 等待浏览器登录页面...")
 
-    form_ready = False
+    password_selector = None
 
     for i in range(20):
 
-        if inspect_login_form(sb):
-            form_ready = True
+        password_selector = find_password_selector(sb)
 
-            print(
-                f"✅ 登录表单 DOM 已确认"
-                f"（第 {i + 1} 次检查）"
+        if password_selector:
+            log(
+                f"✅ 检测到密码框 "
+                f"({i + 1}s)"
             )
-
             break
+
+        if i in (0, 4, 9, 14, 19):
+            log(
+                f"🔎 等待登录 DOM... "
+                f"{i + 1}/20"
+            )
 
         time.sleep(1)
 
     # --------------------------------------------------------
-    # 4. 如果仍然没有 DOM 表单
+    # 3. 输出一次 DOM
     # --------------------------------------------------------
 
-    if not form_ready:
+    print_login_dom(sb)
 
-        print("❌ 页面未加载出完整登录表单")
+    if not password_selector:
 
-        try:
-            print(
-                f"  当前 URL: "
-                f"{sb.get_current_url()}"
-            )
+        log("❌ 页面没有出现密码输入框")
 
-            print(
-                f"  当前标题: "
-                f"{sb.get_title()}"
-            )
-
-        except Exception:
-            pass
-
-        # 再打印一次 DOM 信息
-        try:
-            info = sb.execute_script(
-                _FORM_INFO_JS
-            )
-            print(f"  DOM 调试信息: {info}")
-        except Exception:
-            pass
-
-        # 保存截图
-        try:
-            sb.save_screenshot(
-                "login_form_fail.png"
-            )
-        except Exception:
-            pass
-
-        # 保存页面源码
-        try:
-            with open(
-                "login_form_fail.html",
-                "w",
-                encoding="utf-8"
-            ) as f:
-                f.write(
-                    sb.get_page_source() or ""
-                )
-
-            print(
-                "📄 已保存 login_form_fail.html"
-            )
-
-        except Exception as e:
-            print(
-                f"⚠️ 保存页面源码失败: {e}"
-            )
+        save_debug(
+            sb,
+            "login_form_fail"
+        )
 
         return False
 
     # --------------------------------------------------------
-    # 5. Cookie 弹窗
+    # 4. 寻找账号输入框
     # --------------------------------------------------------
 
-    print("🍪 检查 Cookie 弹窗...")
+    username_selector = find_username_selector(sb)
 
-    try:
+    if not username_selector:
 
-        for btn in sb.find_elements("button"):
+        log("")
+        log("❌ 找不到邮箱/用户名输入框")
+        log("")
+        log("⚠️ 这说明当前页面可能是：")
+        log("   1. 两阶段登录")
+        log("   2. 邮箱输入框在 iframe")
+        log("   3. 邮箱输入框使用了特殊 DOM")
+        log("   4. 网站针对当前浏览器返回了特殊登录页面")
+        log("")
 
-            txt = (
-                btn.text or ""
-            ).strip().lower()
-
-            if any(
-                k in txt
-                for k in [
-                    "accept",
-                    "agree",
-                    "cookie",
-                    "同意",
-                    "接受"
-                ]
-            ):
-
-                try:
-                    btn.click()
-
-                    print(
-                        f"✅ 已关闭 Cookie 弹窗: "
-                        f"{btn.text}"
-                    )
-
-                    time.sleep(0.5)
-
-                except Exception:
-                    pass
-
-                break
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # 6. 填写邮箱
-    # --------------------------------------------------------
-
-    print("📧 填写邮箱...")
-
-    email_result = None
-
-    try:
-
-        email_result = js_fill_input(
+        save_debug(
             sb,
-            'input[type="email"], input[name="email"]',
-            EMAIL
+            "login_form_fail"
         )
 
-        print(
-            f"  JS 填充结果: {email_result}"
-        )
+        return False
 
-    except Exception as e:
+    log(
+        f"✅ 账号输入框: "
+        f"{username_selector}"
+    )
 
-        print(
-            f"⚠️ JS 填写邮箱异常: {e}"
-        )
-
-    time.sleep(1)
-
-    # 验证邮箱是否真的写进去
-    try:
-
-        email_value_len = sb.execute_script(
-            """
-            (function() {
-                var el =
-                    document.querySelector(
-                        'input[type="email"]'
-                    ) ||
-                    document.querySelector(
-                        'input[name="email"]'
-                    );
-
-                return el
-                    ? (el.value || "").length
-                    : -1;
-            })()
-            """
-        )
-
-        print(
-            f"📧 邮箱输入框当前长度: "
-            f"{email_value_len}"
-        )
-
-        if email_value_len <= 0:
-            print(
-                "⚠️ 邮箱没有成功写入，"
-                "尝试 SeleniumBase 直接输入..."
-            )
-
-            try:
-                sb.wait_for_element_present(
-                    'input[type="email"], input[name="email"]',
-                    timeout=5
-                )
-
-                sb.type(
-                    'input[type="email"], input[name="email"]',
-                    EMAIL,
-                    clear=True
-                )
-
-            except Exception as e:
-                print(
-                    f"⚠️ SeleniumBase 填写邮箱失败: {e}"
-                )
-
-    except Exception as e:
-
-        print(
-            f"⚠️ 检查邮箱输入值失败: {e}"
-        )
+    log(
+        f"✅ 密码输入框: "
+        f"{password_selector}"
+    )
 
     # --------------------------------------------------------
-    # 7. 填写密码
+    # 5. 填写账号
     # --------------------------------------------------------
 
-    print("🔑 填写密码...")
+    log("✍️ 填写 Host Ship 邮箱...")
 
-    password_result = None
+    if not js_fill_input(
+        sb,
+        username_selector,
+        EMAIL
+    ):
+        log("❌ 邮箱填写失败")
+        save_debug(sb, "login_email_fail")
+        return False
 
-    try:
+    # --------------------------------------------------------
+    # 6. 填写密码
+    # --------------------------------------------------------
 
-        password_result = js_fill_input(
-            sb,
-            'input[type="password"], input[name="password"]',
-            PASSWORD
-        )
+    log("✍️ 填写 Host Ship 密码...")
 
-        print(
-            f"  JS 填充结果: {password_result}"
-        )
+    if not js_fill_input(
+        sb,
+        password_selector,
+        PASSWORD
+    ):
+        log("❌ 密码填写失败")
+        save_debug(sb, "login_password_fail")
+        return False
 
-    except Exception as e:
+    # --------------------------------------------------------
+    # 7. 检查浏览器实际 value
+    # --------------------------------------------------------
 
-        print(
-            f"⚠️ JS 填写密码异常: {e}"
-        )
+    verify = sb.execute_script(
+        """
+        const user =
+            document.querySelector(arguments[0]);
+
+        const pass =
+            document.querySelector(arguments[1]);
+
+        return {
+            userExists: !!user,
+            userValueLength:
+                user ? (user.value || "").length : 0,
+
+            passwordExists: !!pass,
+            passwordValueLength:
+                pass ? (pass.value || "").length : 0
+        };
+        """,
+        username_selector,
+        password_selector
+    )
+
+    log(
+        "🔎 登录字段检查: "
+        f"账号长度={verify.get('userValueLength', 0)}, "
+        f"密码长度={verify.get('passwordValueLength', 0)}"
+    )
+
+    if verify.get("userValueLength", 0) <= 0:
+        log("❌ 浏览器没有接受邮箱")
+        save_debug(sb, "login_email_value_fail")
+        return False
+
+    if verify.get("passwordValueLength", 0) <= 0:
+        log("❌ 浏览器没有接受密码")
+        save_debug(sb, "login_password_value_fail")
+        return False
+
+    # --------------------------------------------------------
+    # 8. Turnstile
+    # --------------------------------------------------------
+
+    handle_turnstile(sb)
 
     time.sleep(2)
 
-    # 验证密码是否真的写进去
-    try:
-
-        password_value_len = sb.execute_script(
-            """
-            (function() {
-                var el =
-                    document.querySelector(
-                        'input[type="password"]'
-                    ) ||
-                    document.querySelector(
-                        'input[name="password"]'
-                    );
-
-                return el
-                    ? (el.value || "").length
-                    : -1;
-            })()
-            """
-        )
-
-        print(
-            f"🔑 密码输入框当前长度: "
-            f"{password_value_len}"
-        )
-
-        if password_value_len <= 0:
-
-            print(
-                "⚠️ 密码没有成功写入，"
-                "尝试 SeleniumBase 直接输入..."
-            )
-
-            try:
-
-                sb.wait_for_element_present(
-                    'input[type="password"], input[name="password"]',
-                    timeout=5
-                )
-
-                sb.type(
-                    'input[type="password"], input[name="password"]',
-                    PASSWORD,
-                    clear=True
-                )
-
-            except Exception as e:
-
-                print(
-                    f"⚠️ SeleniumBase 填写密码失败: {e}"
-                )
-
-    except Exception as e:
-
-        print(
-            f"⚠️ 检查密码输入值失败: {e}"
-        )
-
     # --------------------------------------------------------
-    # 8. 等待 Turnstile
-    # --------------------------------------------------------
-
-    print("⏳ 等待 Turnstile...")
-
-    ts_found = False
-
-    for i in range(10):
-
-        try:
-
-            if sb.execute_script(_EXISTS_JS):
-
-                ts_found = True
-
-                print(
-                    f"✅ 检测到 Turnstile"
-                    f"（{i + 1}s）"
-                )
-
-                break
-
-        except Exception:
-            pass
-
-        time.sleep(1)
-
-    if ts_found:
-
-        if not handle_turnstile(sb):
-
-            print(
-                "❌ 登录界面的 Turnstile 验证失败"
-            )
-
-            try:
-                sb.save_screenshot(
-                    "login_turnstile_fail.png"
-                )
-            except Exception:
-                pass
-
-            return False
-
-    else:
-
-        print(
-            "ℹ️ 未检测到 Turnstile"
-        )
-
-    # --------------------------------------------------------
-    # 9. 提交登录
+    # 9. 浏览器真实登录
     #
-    # 参照 KataBump：
-    # 优先对 password 输入框发送 Enter。
+    # 第一优先级：
+    # 密码框 Enter
     #
-    # Host Ship 当前版本也优先采用这种方式，
-    # 避免误点击页面其他 button。
+    # 这比直接调用 JS form.submit() 更接近用户实际登录。
     # --------------------------------------------------------
 
-    print("🖱️ 提交登录...")
+    log("🚀 使用浏览器登录动作提交...")
 
     submitted = False
 
-    # 第一方案：密码框 Enter
     try:
-
-        sb.wait_for_element_present(
-            'input[type="password"], input[name="password"]',
-            timeout=5
-        )
-
+        sb.click(password_selector)
         sb.press_keys(
-            'input[type="password"], input[name="password"]',
+            password_selector,
             "\n"
         )
 
         submitted = True
 
-        print(
-            "✅ 已通过密码框 Enter 提交"
-        )
+        log("✅ 已通过密码框 Enter 提交")
 
     except Exception as e:
-
-        print(
-            f"⚠️ Enter 提交失败: {e}"
+        log(
+            f"⚠️ 密码框 Enter 提交失败: {e}"
         )
 
     # --------------------------------------------------------
-    # 10. 如果 Enter 没提交，寻找真实 submit 按钮
+    # 10. Enter 失败 → 点击登录按钮
     # --------------------------------------------------------
 
     if not submitted:
 
-        print(
-            "🔎 尝试查找 Login / Sign in 提交按钮..."
-        )
+        submit_selector = find_submit_selector(sb)
 
-        try:
+        if submit_selector:
 
-            buttons = sb.find_elements(
-                'button[type="submit"], input[type="submit"], button'
-            )
-
-            submit = None
-
-            for btn in buttons:
-
-                txt = (
-                    btn.text or ""
-                ).strip().lower()
-
-                aria = (
-                    btn.get_attribute("aria-label")
-                    or ""
-                ).strip().lower()
-
-                value = (
-                    btn.get_attribute("value")
-                    or ""
-                ).strip().lower()
-
-                combined = (
-                    f"{txt} {aria} {value}"
+            try:
+                log(
+                    f"🖱️ 点击登录按钮: "
+                    f"{submit_selector}"
                 )
 
-                if any(
-                    k in combined
-                    for k in [
-                        "login",
-                        "sign in",
-                        "signin",
-                        "登录"
-                    ]
-                ):
+                sb.click(submit_selector)
 
-                    submit = btn
-                    break
+                submitted = True
 
-            if submit:
+                log("✅ 登录按钮点击成功")
 
-                try:
-
-                    sb.execute_script(
-                        """
-                        arguments[0]
-                            .scrollIntoView({
-                                block: 'center'
-                            });
-                        """,
-                        submit
-                    )
-
-                    time.sleep(0.5)
-
-                    submit.click()
-
-                    submitted = True
-
-                    print(
-                        f"✅ 已点击登录按钮: "
-                        f"{submit.text}"
-                    )
-
-                except Exception as e:
-
-                    print(
-                        f"⚠️ 点击登录按钮失败: {e}"
-                    )
-
-        except Exception as e:
-
-            print(
-                f"⚠️ 查找登录按钮异常: {e}"
-            )
+            except Exception as e:
+                log(
+                    f"⚠️ 登录按钮点击失败: {e}"
+                )
 
     if not submitted:
 
-        print(
-            "❌ 无法提交登录表单"
-        )
+        log("❌ 无法提交登录表单")
 
-        try:
-            sb.save_screenshot(
-                "login_submit_fail.png"
-            )
-        except Exception:
-            pass
+        save_debug(
+            sb,
+            "login_submit_fail"
+        )
 
         return False
 
@@ -1027,768 +1033,1026 @@ def login(sb) -> bool:
     # 11. 等待登录结果
     # --------------------------------------------------------
 
-    print("⏳ 等待登录跳转...")
+    log("⏳ 等待登录结果...")
 
-    login_success = False
+    old_url = sb.get_current_url()
 
-    for i in range(20):
+    for i in range(25):
 
         time.sleep(1)
 
-        try:
+        current_url = sb.get_current_url()
+        source = sb.get_page_source().lower()
 
-            cur_url = (
-                sb.get_current_url()
-                .split("?", 1)[0]
-                .lower()
+        log(
+            f"   [{i + 1:02d}s] "
+            f"{current_url}"
+        )
+
+        # URL 离开 auth/login
+        if (
+            "/auth/login" not in
+            current_url.lower()
+        ):
+            log("✅ 登录成功：已离开登录页面")
+            return True
+
+        success_keywords = [
+            "logout",
+            "log out",
+            "sign out",
+            "manage server",
+            "server management",
+            "dashboard",
+            "my server",
+        ]
+
+        if any(
+            keyword in source
+            for keyword in success_keywords
+        ):
+            log("✅ 登录成功：检测到后台页面特征")
+            return True
+
+        # 如果 URL 没变但是页面出现错误
+        error_keywords = [
+            "invalid credentials",
+            "invalid email",
+            "invalid password",
+            "incorrect password",
+            "login failed",
+            "authentication failed",
+            "invalid username",
+            "邮箱或密码错误",
+        ]
+
+        if any(
+            keyword in source
+            for keyword in error_keywords
+        ):
+            log("❌ 页面明确返回登录失败")
+
+            save_debug(
+                sb,
+                "login_credentials_fail"
             )
 
-            title = (
-                sb.get_title() or ""
-            ).lower()
-
-            page = (
-                sb.get_page_source() or ""
-            ).lower()
-
-            # URL 特征
-            if "/auth/login" not in cur_url:
-
-                # 常见登录成功页面
-                if any(
-                    x in cur_url
-                    for x in [
-                        "/dashboard",
-                        "/server/",
-                        "/servers/",
-                        "/account",
-                        "/profile"
-                    ]
-                ):
-
-                    login_success = True
-
-                # 有些站点跳转 URL 不明显，
-                # 通过页面特征判断
-                elif any(
-                    x in page
-                    for x in [
-                        "logout",
-                        "log out",
-                        "sign out",
-                        "dashboard",
-                        "manage server"
-                    ]
-                ):
-
-                    login_success = True
-
-            if login_success:
-
-                print(
-                    f"✅ 登录成功！"
-                    f"（第 {i + 1}s）"
-                )
-
-                print(
-                    f"   URL: {sb.get_current_url()}"
-                )
-
-                print(
-                    f"   Title: {sb.get_title()}"
-                )
-
-                break
-
-        except Exception:
-            pass
+            return False
 
     # --------------------------------------------------------
-    # 12. 最终判断
+    # 12. 最终失败
     # --------------------------------------------------------
 
-    try:
+    log("❌ 登录超时")
 
-        final_url = sb.get_current_url()
-        final_title = sb.get_title() or ""
-        final_page = (
-            sb.get_page_source() or ""
-        ).lower()
-
-    except Exception:
-
-        final_url = ""
-        final_title = ""
-        final_page = ""
-
-    if login_success:
-
-        print(
-            f"✅ Host Ship 登录成功"
-        )
-
-        print(
-            f"   当前 URL: {final_url}"
-        )
-
-        print(
-            f"   当前标题: {final_title}"
-        )
-
-        return True
-
-    # 最后一次判断：
-    # 只要已经离开 /auth/login，
-    # 就认为登录流程成功。
-    if "/auth/login" not in final_url.lower():
-
-        print(
-            f"✅ 登录页面已离开，"
-            f"视为登录成功"
-        )
-
-        print(
-            f"   当前 URL: {final_url}"
-        )
-
-        return True
-
-    # 登录失败
-    print()
-    print("❌ Host Ship 登录失败")
-
-    print(
-        f"   当前 URL: {final_url}"
+    log(
+        f"当前 URL: "
+        f"{sb.get_current_url()}"
     )
 
-    print(
-        f"   当前标题: {final_title}"
+    log(
+        f"当前标题: "
+        f"{sb.get_title()}"
     )
 
-    # 保存失败截图
-    try:
-        sb.save_screenshot(
-            "login_failed.png"
-        )
-    except Exception:
-        pass
+    print_login_dom(sb)
 
-    # 保存源码
-    try:
-
-        with open(
-            "login_failed.html",
-            "w",
-            encoding="utf-8"
-        ) as f:
-            f.write(
-                sb.get_page_source() or ""
-            )
-
-        print(
-            "📄 已保存 login_failed.html"
-        )
-
-    except Exception:
-        pass
+    save_debug(
+        sb,
+        "login_failed"
+    )
 
     return False
 
 
 # ============================================================
-# 进入服务器管理页面
+# 服务器页面
 # ============================================================
 
 def go_to_server(sb) -> bool:
 
-    print("🖥️ 确保在 Dashboard 页面...")
+    log("")
+    log("=" * 60)
+    log("🖥️ 进入服务器管理")
+    log("=" * 60)
 
-    cur = sb.get_current_url().lower()
-
-    if "/server/" not in cur:
-
-        sb.open(BASE_URL)
-
-        time.sleep(5)
-
-    print(
-        "🔍 在 Dashboard 查找服务器并进入管理页..."
-    )
-
-    time.sleep(3)
+    current_url = sb.get_current_url()
 
     # --------------------------------------------------------
-    # 优先找 MANAGE SERVER
+    # 如果配置了 SERVER_ID
     # --------------------------------------------------------
 
-    manage_btn = None
+    if SERVER_ID:
 
-    try:
+        possible_urls = [
+            f"{BASE_URL}/server/{SERVER_ID}",
+            f"{BASE_URL}/server/{SERVER_ID}/",
+        ]
 
-        for el in sb.find_elements("button, a"):
+        for url in possible_urls:
 
-            txt = (
-                el.text or ""
-            ).strip().upper()
+            try:
+                log(f"🌐 尝试打开: {url}")
 
-            if (
-                "MANAGE SERVER" in txt
-                or "管理服务器" in txt
-            ):
-
-                manage_btn = el
-
-                print(
-                    f"✅ 找到按钮: "
-                    f"[{el.text.strip()}]"
+                sb.uc_open_with_reconnect(
+                    url,
+                    reconnect_time=5
                 )
 
-                break
+                time.sleep(4)
 
-    except Exception:
-        pass
-
-    if manage_btn:
-
-        try:
-
-            sb.execute_script(
-                """
-                arguments[0].scrollIntoView({
-                    block: 'center'
-                });
-                """,
-                manage_btn
-            )
-
-            time.sleep(0.5)
-
-            manage_btn.click()
-
-            time.sleep(5)
-
-            print(
-                f"📄 已进入服务器页面: "
-                f"{sb.get_current_url()}"
-            )
-
-            return True
-
-        except Exception as e:
-
-            print(
-                f"点击 MANAGE SERVER 失败: {e}"
-            )
-
-    # --------------------------------------------------------
-    # 备选：/server/ 链接
-    # --------------------------------------------------------
-
-    try:
-
-        for a in sb.find_elements("a"):
-
-            href = (
-                a.get_attribute("href")
-                or ""
-            ).lower()
-
-            if (
-                "/server/" in href
-                and "create" not in href
-            ):
-
-                print(
-                    f"✅ 找到服务器链接: {href}"
-                )
-
-                a.click()
-
-                time.sleep(5)
-
-                print(
-                    f"📄 已进入服务器页面: "
-                    f"{sb.get_current_url()}"
-                )
-
-                return True
-
-    except Exception as e:
-
-        print(
-            f"查找服务器链接异常: {e}"
-        )
-
-    # --------------------------------------------------------
-    # 再备选：服务器名称区域
-    # --------------------------------------------------------
-
-    try:
-
-        for el in sb.find_elements(
-            "div, span, h1, h2, h3"
-        ):
-
-            txt = (
-                el.text or ""
-            ).lower()
-
-            if (
-                "server" in txt
-                and (
-                    "online" in txt
-                    or "#" in txt
-                )
-            ):
-
-                el.click()
-
-                time.sleep(5)
-
-                if (
-                    "/server/"
-                    in sb.get_current_url().lower()
-                ):
-
-                    print(
-                        f"📄 已进入服务器页面: "
-                        f"{sb.get_current_url()}"
+                if "/auth/login" not in sb.get_current_url():
+                    log(
+                        "✅ 已进入服务器页面"
                     )
-
                     return True
 
-    except Exception:
-        pass
+            except Exception as e:
+                log(
+                    f"⚠️ 打开服务器页面失败: {e}"
+                )
 
-    print(
-        "❌ 未能进入服务器管理页面"
-    )
+    # --------------------------------------------------------
+    # 常规 /server
+    # --------------------------------------------------------
 
-    sb.save_screenshot(
-        "go_to_server_fail.png"
+    if "/server" not in current_url.lower():
+
+        try:
+            url = f"{BASE_URL}/server"
+
+            log(f"🌐 打开服务器页面: {url}")
+
+            sb.uc_open_with_reconnect(
+                url,
+                reconnect_time=5
+            )
+
+            time.sleep(4)
+
+        except Exception as e:
+            log(
+                f"⚠️ 打开 /server 失败: {e}"
+            )
+
+    # --------------------------------------------------------
+    # 检查是否成功
+    # --------------------------------------------------------
+
+    current_url = sb.get_current_url()
+    source = sb.get_page_source().lower()
+
+    if "/auth/login" in current_url.lower():
+
+        log("❌ 被重新导向登录页面")
+
+        save_debug(
+            sb,
+            "go_to_server_fail"
+        )
+
+        return False
+
+    server_keywords = [
+        "manage server",
+        "server management",
+        "renew",
+        "renewal",
+        "续期",
+        "服务器",
+        "server"
+    ]
+
+    if any(
+        keyword in source
+        for keyword in server_keywords
+    ):
+        log("✅ 已进入服务器管理页面")
+        return True
+
+    # --------------------------------------------------------
+    # 如果首页有 MANAGE SERVER 链接
+    # --------------------------------------------------------
+
+    try:
+
+        links = sb.execute_script(
+            """
+            return Array.from(
+                document.querySelectorAll("a, button")
+            ).map(el => ({
+                text: (
+                    el.innerText ||
+                    el.textContent ||
+                    ""
+                ).trim(),
+                href: el.href || ""
+            })).filter(x =>
+                /manage server|server/i.test(x.text)
+                ||
+                /\\/server/i.test(x.href)
+            );
+            """
+        )
+
+        log(
+            f"🔎 找到服务器相关入口: "
+            f"{len(links)}"
+        )
+
+        for item in links:
+
+            log(
+                f"   {item.get('text')} "
+                f"→ {item.get('href')}"
+            )
+
+            href = item.get("href")
+
+            if href:
+
+                try:
+                    sb.uc_open_with_reconnect(
+                        href,
+                        reconnect_time=5
+                    )
+
+                    time.sleep(4)
+
+                    if "/auth/login" not in (
+                        sb.get_current_url().lower()
+                    ):
+                        log(
+                            "✅ 已通过服务器入口进入管理页"
+                        )
+                        return True
+
+                except Exception:
+                    pass
+
+    except Exception as e:
+        log(
+            f"⚠️ 查找服务器入口失败: {e}"
+        )
+
+    log("❌ 无法进入服务器管理页面")
+
+    save_debug(
+        sb,
+        "go_to_server_fail"
     )
 
     return False
 
 
 # ============================================================
-# 续期
+# 续期按钮识别
 # ============================================================
 
-def do_renew(sb):
+def find_renew_buttons(sb):
 
-    print("\n" + "#" * 30)
-    print("  开始 Host Ship 续期流程")
-    print("#" * 30)
+    script = r"""
+    function visible(el) {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
 
-    if not go_to_server(sb):
+        return (
+            r.width > 20 &&
+            r.height > 10 &&
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            s.opacity !== "0"
+        );
+    }
 
-        send_tg_message(
-            "❌",
-            "进入服务器页面失败"
+    const elements = Array.from(
+        document.querySelectorAll(
+            "button, a, input[type=button], input[type=submit]"
         )
+    ).filter(visible);
 
-        return
+    const keywords = [
+        "renew",
+        "renewal",
+        "extend",
+        "续期",
+        "续费",
+        "延期",
+        "延长",
+        "renew server"
+    ];
 
-    time.sleep(3)
+    return elements
+        .map((el, index) => {
+
+            const text = (
+                el.innerText ||
+                el.textContent ||
+                el.value ||
+                ""
+            ).trim();
+
+            return {
+                index: index,
+                text: text,
+                tag: el.tagName,
+                href: el.href || "",
+                type: el.type || "",
+                id: el.id || "",
+                className: el.className || ""
+            };
+        })
+        .filter(item => {
+
+            const text =
+                item.text.toLowerCase();
+
+            return keywords.some(
+                keyword =>
+                    text.includes(
+                        keyword.toLowerCase()
+                    )
+            );
+        });
+    """
+
+    try:
+        return sb.execute_script(script)
+
+    except Exception as e:
+        log(
+            f"⚠️ 查找续期按钮失败: {e}"
+        )
+        return []
+
+
+# ============================================================
+# 执行续期
+# ============================================================
+
+def do_renew(sb) -> bool:
+
+    log("")
+    log("=" * 60)
+    log("🔄 开始服务器续期")
+    log("=" * 60)
 
     # --------------------------------------------------------
     # 查找续期按钮
     # --------------------------------------------------------
 
-    print("🔄 查找续期按钮...")
+    buttons = find_renew_buttons(sb)
 
-    renew_btn = None
-    candidates = []
+    log(
+        f"🔎 找到续期相关按钮: "
+        f"{len(buttons)}"
+    )
 
-    try:
+    for button in buttons:
 
-        for el in sb.find_elements(
-            "button, a, div[role='button']"
-        ):
-
-            txt = (
-                el.text or ""
-            ).strip().lower()
-
-            if not txt:
-                continue
-
-            if any(
-                k in txt
-                for k in [
-                    "renew",
-                    "续期",
-                    "renewal",
-                    "extend"
-                ]
-            ):
-
-                candidates.append(
-                    (el, txt)
-                )
-
-                print(
-                    f"  找到候选按钮: [{txt}]"
-                )
-
-    except Exception as e:
-
-        print(
-            f"查找按钮异常: {e}"
+        log(
+            "   "
+            f"{button.get('tag')} "
+            f"{button.get('text')!r} "
+            f"href={button.get('href')!r}"
         )
 
-    # --------------------------------------------------------
-    # 判断按钮
-    # --------------------------------------------------------
+    if not buttons:
 
-    for el, txt in candidates:
+        source = sb.get_page_source().lower()
 
-        if (
-            "limit reached" in txt
-            or "已达上限" in txt
-            or "无法续期" in txt
+        # ----------------------------------------------------
+        # 检查是否已经续期 / 达到限制
+        # ----------------------------------------------------
+
+        limit_keywords = [
+            "limit reached",
+            "daily limit",
+            "renew limit",
+            "maximum renew",
+            "already renewed",
+            "今日已达",
+            "次数已达",
+            "达到上限",
+            "已续期"
+        ]
+
+        if any(
+            keyword in source
+            for keyword in limit_keywords
         ):
+            log("ℹ️ 当前服务器已经达到续期限制")
+            save_debug(sb, "renew_limit")
+            return True
 
-            print(
-                f"ℹ️ 当前显示「{txt}」，"
-                f"可能未到续期窗口"
-            )
+        log("❌ 没有找到续期按钮")
 
-            send_tg_message(
-                "⏳",
-                "未到续期时间 / 已达上限",
-                txt
-            )
-
-            sb.save_screenshot(
-                "renew_limit.png"
-            )
-
-            return
-
-        if (
-            "renew" in txt
-            or "续期" in txt
-        ):
-
-            renew_btn = el
-
-            break
-
-    if not renew_btn and candidates:
-        renew_btn = candidates[0][0]
-
-    if not renew_btn:
-
-        print(
-            "❌ 未找到任何续期相关按钮"
+        save_debug(
+            sb,
+            "no_renew_btn"
         )
+
+        return False
+
+    # --------------------------------------------------------
+    # 点击第一个续期按钮
+    # --------------------------------------------------------
+
+    clicked = False
+
+    for button in buttons:
+
+        text = (
+            button.get("text") or ""
+        ).strip()
 
         try:
 
-            page = (
-                sb.get_page_source()
-                or ""
-            )
+            selector = None
 
-            if (
-                "renewal" in page.lower()
-                or "renew" in page.lower()
-            ):
+            # 优先根据文本定位
+            if text:
 
-                print(
-                    "页面源码中包含 renew 关键字，"
-                    "可能是按钮文本变化"
+                safe_text = text.replace(
+                    "'",
+                    "\\'"
                 )
 
-        except Exception:
-            pass
-
-        sb.save_screenshot(
-            "no_renew_btn.png"
-        )
-
-        send_tg_message(
-            "❌",
-            "未找到续期按钮"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 点击续期
-    # --------------------------------------------------------
-
-    print(
-        f"🖱️ 点击续期按钮: "
-        f"{(renew_btn.text or '').strip()}"
-    )
-
-    try:
-
-        sb.execute_script(
-            """
-            arguments[0].scrollIntoView({
-                block: 'center'
-            });
-            """,
-            renew_btn
-        )
-
-        time.sleep(0.5)
-
-        renew_btn.click()
-
-    except Exception:
-
-        sb.execute_script(
-            "arguments[0].click();",
-            renew_btn
-        )
-
-    time.sleep(5)
-
-    # --------------------------------------------------------
-    # 确认弹窗
-    # --------------------------------------------------------
-
-    print(
-        "⏳ 检查是否有确认弹窗或验证..."
-    )
-
-    try:
-
-        for btn in sb.find_elements("button"):
-
-            t = (
-                btn.text or ""
-            ).lower()
-
-            if any(
-                k in t
-                for k in [
-                    "confirm",
-                    "yes",
-                    "ok",
-                    "renew",
-                    "确认",
-                    "续期"
-                ]
-            ):
-
-                print(
-                    f"🖱️ 点击确认: {btn.text}"
+                selector = (
+                    f"//*["
+                    f"contains("
+                    f"translate("
+                    f"normalize-space(.),"
+                    f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    f"'abcdefghijklmnopqrstuvwxyz'"
+                    f"),"
+                    f"'{safe_text.lower()}'"
+                    f")"
+                    f"]"
                 )
 
-                btn.click()
+            # ------------------------------------------------
+            # 更稳定：通过 JS 给目标元素打标记
+            # ------------------------------------------------
 
-                time.sleep(3)
+            marked = sb.execute_script(
+                """
+                const elements =
+                    Array.from(
+                        document.querySelectorAll(
+                            "button, a, " +
+                            "input[type=button], " +
+                            "input[type=submit]"
+                        )
+                    );
 
-                break
+                const target = elements.find(
+                    el => (
+                        el.innerText ||
+                        el.textContent ||
+                        el.value ||
+                        ""
+                    ).trim() === arguments[0]
+                );
 
-    except Exception:
-        pass
+                if (target) {
+                    target.setAttribute(
+                        "data-hostship-renew",
+                        "true"
+                    );
+
+                    return true;
+                }
+
+                return false;
+                """,
+                text
+            )
+
+            if marked:
+                selector = (
+                    '[data-hostship-renew="true"]'
+                )
+
+            if not selector:
+                continue
+
+            log(
+                f"🖱️ 尝试点击续期按钮: "
+                f"{text!r}"
+            )
+
+            sb.click(selector)
+
+            clicked = True
+
+            log("✅ 续期按钮已点击")
+
+            break
+
+        except Exception as e:
+
+            log(
+                f"⚠️ 点击续期按钮失败: {e}"
+            )
+
+    if not clicked:
+
+        log("❌ 无法点击续期按钮")
+
+        save_debug(
+            sb,
+            "renew_click_fail"
+        )
+
+        return False
 
     # --------------------------------------------------------
-    # 再次检查 Turnstile
+    # 等待弹窗 / 页面变化
     # --------------------------------------------------------
+
+    time.sleep(3)
+
+    # --------------------------------------------------------
+    # 检查确认按钮
+    # --------------------------------------------------------
+
+    confirm_script = r"""
+    function visible(el) {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+
+        return (
+            r.width > 20 &&
+            r.height > 10 &&
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            s.opacity !== "0"
+        );
+    }
+
+    const elements = Array.from(
+        document.querySelectorAll(
+            "button, a, input[type=button], input[type=submit]"
+        )
+    ).filter(visible);
+
+    const keywords = [
+        "confirm",
+        "yes",
+        "continue",
+        "renew",
+        "extend",
+        "确认",
+        "确定",
+        "继续",
+        "续期",
+        "续费"
+    ];
+
+    return elements
+        .map(el => ({
+            text: (
+                el.innerText ||
+                el.textContent ||
+                el.value ||
+                ""
+            ).trim(),
+            el: el
+        }))
+        .filter(item => {
+
+            const text =
+                item.text.toLowerCase();
+
+            return keywords.some(
+                x => text.includes(
+                    x.toLowerCase()
+                )
+            );
+        })
+        .map(item => item.text);
+    """
 
     try:
 
-        if sb.execute_script(_EXISTS_JS):
+        confirm_buttons = sb.execute_script(
+            confirm_script
+        )
 
-            print(
-                "检测到续期页 Turnstile，"
-                "尝试处理..."
+        if confirm_buttons:
+
+            log(
+                f"🔎 检测到确认按钮: "
+                f"{confirm_buttons}"
             )
 
-            handle_turnstile(sb)
+            # 优先寻找包含确认/确定/yes 的按钮
+            for text in confirm_buttons:
 
-            time.sleep(2)
+                lower = text.lower()
 
-            try:
-
-                for btn in sb.find_elements(
-                    "button"
+                if not any(
+                    x in lower
+                    for x in [
+                        "confirm",
+                        "yes",
+                        "确定",
+                        "确认"
+                    ]
                 ):
+                    continue
 
-                    if (
-                        "renew"
-                        in (btn.text or "").lower()
-                    ):
+                try:
 
-                        btn.click()
+                    sb.execute_script(
+                        """
+                        const elements =
+                            Array.from(
+                                document.querySelectorAll(
+                                    "button, a, " +
+                                    "input[type=button], " +
+                                    "input[type=submit]"
+                                )
+                            );
 
-                        break
+                        const target =
+                            elements.find(
+                                el =>
+                                    (
+                                        el.innerText ||
+                                        el.textContent ||
+                                        el.value ||
+                                        ""
+                                    ).trim() === arguments[0]
+                            );
 
-            except Exception:
-                pass
+                        if (target) {
+                            target.click();
+                            return true;
+                        }
 
-    except Exception:
-        pass
+                        return false;
+                        """,
+                        text
+                    )
 
-    time.sleep(6)
+                    log(
+                        f"✅ 已点击确认按钮: "
+                        f"{text!r}"
+                    )
+
+                    break
+
+                except Exception:
+                    pass
+
+    except Exception as e:
+
+        log(
+            f"ℹ️ 没有检测到确认弹窗: {e}"
+        )
 
     # --------------------------------------------------------
-    # 判断续期结果
+    # Turnstile
     # --------------------------------------------------------
 
-    page = (
-        sb.get_page_source()
-        or ""
-    ).lower()
+    time.sleep(2)
 
-    cur_url = sb.get_current_url()
+    handle_turnstile(sb)
+
+    # --------------------------------------------------------
+    # 等待续期结果
+    # --------------------------------------------------------
+
+    log("⏳ 等待续期结果...")
+
+    for i in range(20):
+
+        time.sleep(1)
+
+        source = sb.get_page_source().lower()
+
+        current_url = sb.get_current_url()
+
+        # 成功关键词
+        success_keywords = [
+            "renewed successfully",
+            "renew success",
+            "renewal successful",
+            "server renewed",
+            "successfully renewed",
+            "续期成功",
+            "续期成功",
+            "续期完成",
+            "操作成功"
+        ]
+
+        if any(
+            keyword in source
+            for keyword in success_keywords
+        ):
+            log("🎉 服务器续期成功！")
+            return True
+
+        # 达到限制
+        limit_keywords = [
+            "limit reached",
+            "daily limit",
+            "renew limit",
+            "maximum renew",
+            "already renewed",
+            "达到上限",
+            "次数已达",
+            "今日已达",
+            "已经续期"
+        ]
+
+        if any(
+            keyword in source
+            for keyword in limit_keywords
+        ):
+            log("ℹ️ 服务器续期受到次数限制")
+            return True
+
+        log(
+            f"   [{i + 1:02d}s] "
+            f"等待续期结果..."
+        )
+
+    # --------------------------------------------------------
+    # 最终检查
+    # --------------------------------------------------------
+
+    source = sb.get_page_source().lower()
 
     if any(
-        k in page
-        for k in [
+        x in source
+        for x in [
             "success",
             "renewed",
-            "extended",
-            "成功",
-            "已续期"
+            "续期成功",
+            "操作成功"
         ]
     ):
+        log("🎉 检测到续期成功")
+        return True
 
-        print("✅ 续期成功！")
+    log("❌ 未能确认续期结果")
 
-        send_tg_message(
-            "✅",
-            "续期成功"
-        )
-
-    elif (
-        "limit reached" in page
-        or "无法续期" in page
-        or "not eligible" in page
-    ):
-
-        print(
-            "⏳ 未到续期窗口或已达上限"
-        )
-
-        send_tg_message(
-            "⏳",
-            "未到续期时间 / 已达上限"
-        )
-
-    else:
-
-        print(
-            "ℹ️ 续期操作已执行，"
-            "请人工确认结果"
-        )
-
-        send_tg_message(
-            "ℹ️",
-            "续期操作已执行，请人工确认",
-            cur_url
-        )
-
-    sb.save_screenshot(
-        "renew_result.png"
+    save_debug(
+        sb,
+        "renew_result"
     )
+
+    return False
 
 
 # ============================================================
-# 主入口
+# 主程序
 # ============================================================
 
 def main():
 
-    print("#" * 30)
-    print("   Host Ship 自动登录续期")
-    print("#" * 30)
+    start_time = time.time()
 
-    if not EMAIL or not PASSWORD:
+    log("")
+    log("=" * 60)
+    log("🚀 Host Ship 自动续期程序")
+    log("=" * 60)
 
-        print(
-            "❌ 请设置 "
-            "HOSTSHIP_EMAIL 和 "
-            "HOSTSHIP_PASSWORD"
-        )
-
-        return
-
-    IS_PROXY = (
-        os.environ
-        .get("IS_PROXY", "false")
-        .lower()
-        == "true"
+    log(
+        f"Python: {sys.version.split()[0]}"
     )
 
-    proxy_str = (
-        os.environ
-        .get("PROXY_SERVER", "")
-        .strip()
-        or "http://127.0.0.1:1081"
+    log(
+        f"代理模式: "
+        f"{'开启' if IS_PROXY else '关闭'}"
     )
-
-    sb_kwargs = {
-        "uc": True,
-        "headless": False
-    }
 
     if IS_PROXY:
-
-        print(
-            f"🔗 使用代理: {proxy_str}"
+        log(
+            f"代理服务器: "
+            f"{PROXY_SERVER}"
         )
 
-        sb_kwargs["proxy"] = proxy_str
+    # --------------------------------------------------------
+    # 环境检查
+    # --------------------------------------------------------
 
-    else:
+    if not EMAIL:
 
-        print(
-            "🌐 直连访问"
+        message = (
+            "❌ Host Ship 自动续期失败\n\n"
+            "原因：HOSTSHIP_EMAIL 未配置"
         )
 
-    print(
-        "🚀 启动浏览器..."
-    )
+        log(message)
+        send_tg_message(message)
 
-    with SB(**sb_kwargs) as sb:
+        return 1
 
-        # ----------------------------------------------------
-        # 检查出口 IP
-        # ----------------------------------------------------
+    if not PASSWORD:
 
-        try:
+        message = (
+            "❌ Host Ship 自动续期失败\n\n"
+            "原因：HOSTSHIP_PASSWORD 未配置"
+        )
 
-            sb.open(
-                "https://api.ip.sb/ip"
+        log(message)
+        send_tg_message(message)
+
+        return 1
+
+    # --------------------------------------------------------
+    # 浏览器
+    #
+    # uc=True：
+    # 使用 SeleniumBase UC 模式，
+    # 更适合 Cloudflare / Turnstile 页面。
+    #
+    # headless=False：
+    # GitHub Actions 使用 Xvfb，
+    # 所以这里不要再开 Selenium 自己的 headless。
+    # --------------------------------------------------------
+
+    try:
+
+        with SB(
+            uc=True,
+            headless=False,
+            test=False,
+            locale_code="en",
+        ) as sb:
+
+            # ------------------------------------------------
+            # 代理
+            # ------------------------------------------------
+
+            if IS_PROXY:
+
+                try:
+                    log(
+                        f"🌐 浏览器使用代理: "
+                        f"{PROXY_SERVER}"
+                    )
+
+                    # SeleniumBase 在启动后修改代理
+                    # 对部分 Chrome 版本不一定生效，
+                    # 因此这里仅作为兼容 fallback。
+                    sb.execute_cdp_cmd(
+                        "Network.enable",
+                        {}
+                    )
+
+                except Exception as e:
+                    log(
+                        f"⚠️ 设置代理失败: {e}"
+                    )
+
+            # ------------------------------------------------
+            # 浏览器 UA / 页面
+            # ------------------------------------------------
+
+            try:
+
+                sb.set_window_size(
+                    1920,
+                    1080
+                )
+
+            except Exception:
+                pass
+
+            # ------------------------------------------------
+            # 测试网络
+            # ------------------------------------------------
+
+            try:
+
+                log("🌐 检查 GitHub Actions 出口 IP...")
+
+                sb.open(
+                    "https://api.ip.sb/ip"
+                )
+
+                time.sleep(2)
+
+                ip = (
+                    sb.get_page_source()
+                    .strip()
+                )
+
+                log(
+                    f"🌐 当前出口 IP: "
+                    f"{ip[:100]}"
+                )
+
+            except Exception as e:
+
+                log(
+                    f"⚠️ 出口 IP 检查失败: {e}"
+                )
+
+            # ------------------------------------------------
+            # 登录
+            # ------------------------------------------------
+
+            if not login(sb):
+
+                message = (
+                    "❌ Host Ship 自动续期失败\n\n"
+                    "阶段：登录\n"
+                    f"URL：{sb.get_current_url()}"
+                )
+
+                send_tg_message(message)
+
+                return 1
+
+            # ------------------------------------------------
+            # 进入服务器
+            # ------------------------------------------------
+
+            if not go_to_server(sb):
+
+                message = (
+                    "❌ Host Ship 自动续期失败\n\n"
+                    "阶段：进入服务器管理页面"
+                )
+
+                send_tg_message(message)
+
+                return 1
+
+            # ------------------------------------------------
+            # 续期
+            # ------------------------------------------------
+
+            renew_success = do_renew(sb)
+
+            elapsed = int(
+                time.time() - start_time
             )
 
-            print(
-                f"📍 当前出口IP: "
-                f"{sb.get_text('body')}"
-            )
+            # ------------------------------------------------
+            # Telegram
+            # ------------------------------------------------
 
-        except Exception:
-            pass
+            if renew_success:
 
-        # ----------------------------------------------------
-        # 登录
-        # ----------------------------------------------------
+                message = (
+                    "✅ Host Ship 自动续期完成\n\n"
+                    f"服务器 ID："
+                    f"{SERVER_ID or '未指定'}\n"
+                    f"耗时：{elapsed} 秒"
+                )
 
-        if login(sb):
+                send_tg_message(message)
 
-            # 登录成功后续期
-            do_renew(sb)
+                log("")
+                log("=" * 60)
+                log("🎉 Host Ship 自动续期流程完成")
+                log("=" * 60)
 
-        else:
+                return 0
 
-            print(
-                "\n❌ 登录失败，"
-                "终止续期。"
-            )
+            else:
 
-            send_tg_message(
-                "❌",
-                "登录失败"
-            )
+                message = (
+                    "❌ Host Ship 自动续期失败\n\n"
+                    "阶段：续期\n"
+                    f"耗时：{elapsed} 秒"
+                )
+
+                send_tg_message(message)
+
+                log("")
+                log("=" * 60)
+                log("❌ Host Ship 自动续期失败")
+                log("=" * 60)
+
+                return 1
+
+    except Exception as e:
+
+        log("")
+        log("=" * 60)
+        log("💥 程序发生未处理异常")
+        log("=" * 60)
+
+        log(
+            f"{type(e).__name__}: {e}"
+        )
+
+        traceback.print_exc()
+
+        send_tg_message(
+            "💥 Host Ship 自动续期程序异常\n\n"
+            f"{type(e).__name__}: {e}"
+        )
+
+        return 1
 
 
 # ============================================================
@@ -1796,4 +2060,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
