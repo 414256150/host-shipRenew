@@ -1,221 +1,430 @@
 #!/usr/bin/env python3
-"""
-Host-Ship 自动续订脚本 - DrissionPage 版本
-支持多服务器自动遍历续签、冷却时间 (CD) 自动检测等待与重试、失败/成功推送截图至 Telegram
-"""
+# -*- coding: utf-8 -*-
 
 import os
-import sys
 import time
-import re
+import subprocess
 import requests
-from xvfbwrapper import Xvfb
-from DrissionPage import ChromiumPage, ChromiumOptions
+from seleniumbase import SB
 
-# ==============================================================================
-# 统一日志 & Telegram 通知
-# ==============================================================================
-def log(msg, level="INFO"):
-    prefix = {"INFO": "[INFO]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[INFO]")
-    print(f"{prefix} {msg}", flush=True)
+# 从环境变量获取账号密码和 TG 配置
+EMAIL        = os.environ.get("HOSTSHIP_EMAIL") or ""
+PASSWORD     = os.environ.get("HOSTSHIP_PASSWORD") or ""
+SERVER_ID    = os.environ.get("HOSTSHIP_SERVER_ID") or ""   # 例如 7e97dcac（不含#）
+TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
-def send_tg_photo(token, chat_id, photo_path, caption, parse_mode='HTML'):
-    if not token or not chat_id:
-        log("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知。", "WARN")
+BASE_URL = "https://panel.host-ship.com"
+
+# ===================== Telegram 推送 =====================
+def send_tg_message(status_icon, status_text, extra=""):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
         return
-    if not photo_path or not os.path.exists(photo_path):
-        log(f"未找到截图文件 {photo_path}，跳过通知。", "WARN")
-        return
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+
+    local_time = time.gmtime(time.time() + 8 * 3600)
+    current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+
+    if '@' in EMAIL:
+        name, domain = EMAIL.split('@', 1)
+        masked_email = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
+    else:
+        masked_email = EMAIL[:2] + '****'
+
+    text = (
+        f"🚢 Host Ship 续期通知\n\n"
+        f"{status_icon} {status_text}\n"
+        f"👤 账户: {masked_email}\n"
+        f"🖥️ 服务器: #{SERVER_ID}\n"
+        f"⏱️ 时间: {current_time_str}"
+    )
+    if extra:
+        text += f"\n📋 详情: {extra}"
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        with open(photo_path, "rb") as photo_file:
-            response = requests.post(
-                url,
-                data={"chat_id": chat_id, "caption": caption, "parse_mode": parse_mode},
-                files={"photo": photo_file},
-                timeout=30,
-            )
-        response.raise_for_status()
-        log("Telegram 图片通知发送成功")
-    except Exception as e:
-        log(f"Telegram 图片通知异常: {e}", "ERROR")
-
-# ==============================================================================
-# 主自动化流程
-# ==============================================================================
-def main():
-    tg_token = os.getenv("TG_BOT_TOKEN")
-    tg_chat_id = os.getenv("TG_CHAT_ID")
-    username = os.getenv("PANEL_USER")
-    password = os.getenv("PANEL_PASS")
-
-    if not username or not password:
-        log("请在 GitHub Secrets 中配置 PANEL_USER 和 PANEL_PASS", "ERROR")
-        sys.exit(1)
-
-    panel_url = "https://panel.host-ship.com"
-    login_url = f"{panel_url}/auth/login"
-
-    # 截图目录初始化
-    screenshot_dir = "output/screenshots"
-    os.makedirs(screenshot_dir, exist_ok=True)
-
-    # 启动虚拟显示屏 (GitHub Actions 环境需要)
-    vdisplay = Xvfb(width=1920, height=1080, colordepth=24)
-    vdisplay.start()
-
-    page = None
-    try:
-        co = ChromiumOptions()
-        co.set_browser_path('/usr/bin/google-chrome')
-        co.set_argument('--no-sandbox')
-        co.set_argument('--disable-dev-shm-usage')
-        co.set_argument('--window-size=1920,1080')
-        co.headless(False)  # 在 Xvfb 下可为 False 模拟真实界面渲染
-        page = ChromiumPage(co)
-
-        # ---------------------------------------------------------
-        # 1. 登录面板
-        # ---------------------------------------------------------
-        log(f"访问登录页面: {login_url}")
-        page.get(login_url)
-        time.sleep(4)
-
-        log("填写账号密码...")
-        user_input = page.ele('css:input[name="user"], input[type="text"], input[type="email"]')
-        pass_input = page.ele('css:input[name="password"], input[type="password"]')
-        submit_btn = page.ele('css:button[type="submit"]')
-
-        if user_input and pass_input and submit_btn:
-            user_input.input(username)
-            pass_input.input(password)
-            submit_btn.click()
-            time.sleep(5)
+        r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
+        if r.status_code == 200:
+            print("📩 Telegram 通知发送成功！")
         else:
-            log("找不到登录表单元素，页面结构可能已更改", "ERROR")
-            err_shot = page.get_screenshot(path=f"{screenshot_dir}/login_error.png")
-            send_tg_photo(tg_token, tg_chat_id, err_shot, "❌ Host-Ship 登录失败：找不到输入框")
-            sys.exit(1)
-
-        # ---------------------------------------------------------
-        # 2. 遍历 Dashboard 抓取服务器并续期
-        # ---------------------------------------------------------
-        page.get(panel_url)
-        time.sleep(4)
-
-        # 匹配包含 "manage server" 文本的按钮或链接（忽略大小写）
-        manage_btns = [el for el in page.eles('tag:button') + page.eles('tag:a') if el.text and 'manage server' in el.text.lower()]
-        server_count = len(manage_btns)
-        log(f"仪表盘检索到 {server_count} 个服务器待处理")
-
-        if server_count == 0:
-            log("未找到 Manage Server 按钮，可能是账号内没有机器或登录未成功", "WARN")
-            err_shot = page.get_screenshot(path=f"{screenshot_dir}/dashboard_no_servers.png")
-            send_tg_photo(tg_token, tg_chat_id, err_shot, "⚠️ Host-Ship：登录成功但未发现可管理的服务器")
-            sys.exit(1)
-
-        total_success = 0
-
-        for i in range(server_count):
-            server_name = f"Server_{i+1}"
-            log(f"========== 开始处理 {server_name} ==========")
-            
-            # 每次处理前退回仪表盘，避免页面层级混乱
-            page.get(panel_url)
-            time.sleep(4)
-
-            # 重新抓取元素列表防止 DOM 元素失效 (StaleElementReference)
-            current_btns = [el for el in page.eles('tag:button') + page.eles('tag:a') if el.text and 'manage server' in el.text.lower()]
-            
-            if i >= len(current_btns):
-                log(f"{server_name} 管理按钮丢失，跳过", "WARN")
-                continue
-
-            try:
-                current_btns[i].click()
-            except Exception:
-                current_btns[i].click(by_js=True)
-            
-            time.sleep(6) # 等待控制台完全加载
-
-            # 步骤 3: 查找侧边栏的 Renew 按钮
-            log(f"查找 {server_name} 的 Renew 按钮...")
-            renew_btn = next((el for el in page.eles('tag:button') if el.text and el.text.strip().lower() == 'renew limit reached'), None)
-            
-            if not renew_btn:
-                log(f"{server_name} 未找到 Renew 按钮，可能时间未到或已被风控", "WARN")
-                shot = page.get_screenshot(path=f"{screenshot_dir}/{server_name}_no_renew.png")
-                send_tg_photo(tg_token, tg_chat_id, shot, f"⚠️ Host-Ship：{server_name} 找不到续期入口")
-                continue
-
-            try:
-                renew_btn.click()
-            except Exception:
-                renew_btn.click(by_js=True)
-            
-            time.sleep(2) # 等待弹窗弹出
-
-            # 步骤 4: 确认弹窗里的 Renew now
-            log(f"确认弹窗 Renew now...")
-            renew_now_btn = next((el for el in page.eles('tag:button') if el.text and el.text.strip().lower() == 'renew now'), None)
-            
-            if not renew_now_btn:
-                log(f"{server_name} 弹窗加载失败或未找到最终确认按钮", "WARN")
-                shot = page.get_screenshot(path=f"{screenshot_dir}/{server_name}_no_renew_now.png")
-                send_tg_photo(tg_token, tg_chat_id, shot, f"⚠️ Host-Ship：{server_name} 续期弹窗未正常弹出")
-                continue
-
-            try:
-                renew_now_btn.click()
-            except Exception:
-                renew_now_btn.click(by_js=True)
-
-            time.sleep(2) # 给页面反应和渲染警告框的时间
-
-            # ---------------------------------------------------------
-            # 检测是否触发 CD 频率限制 (如 "You can renew again in XX seconds.")
-            # ---------------------------------------------------------
-            alert_el = page.ele('text:You can renew again in')
-            if alert_el:
-                alert_text = alert_el.text
-                match = re.search(r'(\d+)\s*seconds', alert_text, re.IGNORECASE)
-                wait_time = int(match.group(1)) + 3 if match else 50 # 提取秒数并多加 3 秒缓冲
-                log(f"⚠️ 触发面板 CD 限制: [{alert_text}]，等待 {wait_time} 秒后自动重试...", "WARN")
-                time.sleep(wait_time)
-
-                # 重新点击续期确认按钮
-                log("CD 结束，再次尝试点击 Renew now...")
-                try:
-                    renew_now_btn.click()
-                except Exception:
-                    renew_now_btn.click(by_js=True)
-                time.sleep(3)
-
-            log(f"✅ {server_name} 点击续期完成，进行截图备份")
-            time.sleep(4)
-            shot = page.get_screenshot(path=f"{screenshot_dir}/{server_name}_success.png")
-            send_tg_photo(tg_token, tg_chat_id, shot, f"✅ Host-Ship 续订成功\n\n目标：{server_name}\n面板：panel.host-ship.com")
-            total_success += 1
-
-            # 如果同一账号下还有后续服务器，主程序等待 60 秒防止触发下一个 CD
-            if i < server_count - 1:
-                log("等待 60 秒后开始处理同一账号下的下一个服务器...")
-                time.sleep(60)
-
-        log(f"任务执行完毕，成功处理 {total_success}/{server_count} 个服务器")
-
+            print(f"⚠️ Telegram 通知发送失败: {r.text}")
     except Exception as e:
-        log(f"执行时发生严重错误: {e}", "ERROR")
-        if page:
-            err_shot = page.get_screenshot(path=f"{screenshot_dir}/fatal_error.png")
-            send_tg_photo(tg_token, tg_chat_id, err_shot, f"❌ Host-Ship 脚本运行崩溃\n\n报错信息:\n{str(e)[:200]}")
-    finally:
-        if page:
+        print(f"⚠️ Telegram 通知发送异常: {e}")
+
+# ===================== 页面注入脚本 =====================
+_EXPAND_JS = """
+(function() {
+    var ts = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!ts) return 'no-turnstile';
+    var el = ts;
+    for (var i = 0; i < 20; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var s = window.getComputedStyle(el);
+        if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden')
+            el.style.overflow = 'visible';
+        el.style.minWidth = 'max-content';
+    }
+    document.querySelectorAll('iframe').forEach(function(f){
+        if (f.src && f.src.includes('challenges.cloudflare.com')) {
+            f.style.width = '300px'; f.style.height = '65px';
+            f.style.minWidth = '300px';
+            f.style.visibility = 'visible'; f.style.opacity = '1';
+        }
+    });
+    return 'done';
+})()
+"""
+
+_EXISTS_JS = """
+(function(){
+    return document.querySelector('input[name="cf-turnstile-response"]') !== null;
+})()
+"""
+
+_SOLVED_JS = """
+(function(){
+    var i = document.querySelector('input[name="cf-turnstile-response"]');
+    return !!(i && i.value && i.value.length > 20);
+})()
+"""
+
+# ===================== 工具函数 =====================
+def js_fill_input(sb, selector: str, text: str):
+    safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
+    sb.execute_script(f"""
+    (function(){{
+        var el = document.querySelector('{selector}');
+        if (!el) return;
+        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        if (nativeInputValueSetter) {{
+            nativeInputValueSetter.call(el, "{safe_text}");
+        }} else {{
+            el.value = "{safe_text}";
+        }}
+        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    }})()
+    """)
+
+def handle_turnstile(sb) -> bool:
+    print("🔍 处理 Cloudflare Turnstile 验证...")
+    time.sleep(2)
+
+    if sb.execute_script(_SOLVED_JS):
+        print("✅ 已静默通过")
+        return True
+
+    for _ in range(3):
+        try:
+            sb.execute_script(_EXPAND_JS)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    for attempt in range(6):
+        if sb.execute_script(_SOLVED_JS):
+            print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
+            return True
+
+        print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
+        try:
+            sb.uc_gui_click_captcha()
+        except Exception as e:
+            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
+
+        for _ in range(16):
+            time.sleep(0.5)
+            if sb.execute_script(_SOLVED_JS):
+                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
+                return True
+
+        print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
+
+    print("❌ Turnstile 6 次均失败")
+    return False
+
+# ===================== 登录 =====================
+def login(sb) -> bool:
+    print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
+    sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
+    time.sleep(8)
+
+    print("⏳ 等待页面加载 / Cloudflare...")
+    cf_passed = False
+    for i in range(30):
+        page_src = (sb.get_page_source() or "").lower()
+        if 'type="email"' in page_src or 'name="email"' in page_src or 'type="password"' in page_src:
+            cf_passed = True
+            print(f"✅ 登录表单已出现（{i+1}s）")
+            break
+        time.sleep(1)
+    if not cf_passed:
+        print("⚠️ 可能仍有 Cloudflare 验证，继续尝试...")
+
+    try:
+        sb.wait_for_element('input[type="email"], input[name="email"]', timeout=15)
+    except Exception:
+        print("❌ 页面未加载出登录表单")
+        print(f"  当前 URL: {sb.get_current_url()}")
+        print(f"  当前标题: {sb.get_title()}")
+        sb.save_screenshot("login_load_fail.png")
+        return False
+
+    # 关闭可能的 Cookie 弹窗
+    try:
+        for btn in sb.find_elements("button"):
+            txt = (btn.text or "").lower()
+            if "accept" in txt or "同意" in txt or "cookie" in txt:
+                btn.click()
+                time.sleep(0.5)
+                break
+    except Exception:
+        pass
+
+    print("📧 填写邮箱...")
+    js_fill_input(sb, 'input[type="email"], input[name="email"]', EMAIL)
+    time.sleep(1)
+
+    print("🔑 填写密码...")
+    js_fill_input(sb, 'input[type="password"], input[name="password"]', PASSWORD)
+    time.sleep(2)
+
+    # 等待并处理 Turnstile
+    print("⏳ 等待 Turnstile...")
+    ts_found = False
+    for i in range(10):
+        if sb.execute_script(_EXISTS_JS):
+            ts_found = True
+            print(f"✅ 检测到 Turnstile（{i+1}s）")
+            break
+        time.sleep(1)
+
+    if ts_found:
+        if not handle_turnstile(sb):
+            print("❌ 登录界面的 Turnstile 验证失败")
+            sb.save_screenshot("login_turnstile_fail.png")
+            return False
+    else:
+        print("ℹ️ 未检测到 Turnstile")
+
+    print("🖱️ 提交登录...")
+    try:
+        # 优先找提交按钮
+        submit = None
+        for sel in ['button[type="submit"]', 'button.btn-primary', 'button']:
             try:
-                page.quit()
+                btns = sb.find_elements(sel)
+                for b in btns:
+                    t = (b.text or "").lower()
+                    if "login" in t or "sign in" in t or "登录" in t or not t:
+                        submit = b
+                        break
+                if submit:
+                    break
             except Exception:
-                pass
-        vdisplay.stop()
+                continue
+        if submit:
+            submit.click()
+        else:
+            sb.press_keys('input[type="password"]', '\n')
+    except Exception:
+        sb.press_keys('input[type="password"]', '\n')
+
+    print("⏳ 等待登录跳转...")
+    for _ in range(15):
+        time.sleep(1)
+        cur = sb.get_current_url().lower()
+        title = (sb.get_title() or "").lower()
+        if "/auth/login" not in cur and ("dashboard" in cur or "server" in cur or "welcome" in title):
+            break
+
+    cur = sb.get_current_url().lower()
+    if "/auth/login" not in cur:
+        print(f"✅ 登录成功！(URL: {sb.get_current_url()})")
+        return True
+
+    print(f"❌ 登录失败 (URL: {sb.get_current_url()}, Title: {sb.get_title()})")
+    sb.save_screenshot("login_failed.png")
+    return False
+
+# ===================== 续期流程 =====================
+def go_to_server(sb) -> bool:
+    if not SERVER_ID:
+        print("❌ 未设置 HOSTSHIP_SERVER_ID")
+        return False
+
+    target = f"{BASE_URL}/server/{SERVER_ID}"
+    print(f"🖥️ 进入服务器页面: {target}")
+    sb.uc_open_with_reconnect(target, reconnect_time=6)
+    time.sleep(6)
+
+    cur = sb.get_current_url().lower()
+    if SERVER_ID.lower() not in cur:
+        # 尝试从 Dashboard 点击
+        print("⚠️ 直接访问失败，尝试从 Dashboard 进入...")
+        sb.open(BASE_URL)
+        time.sleep(5)
+        try:
+            # 截图中服务器卡片有 "MANAGE SERVER" 按钮
+            for a in sb.find_elements("a, button"):
+                href = (a.get_attribute("href") or "").lower()
+                txt = (a.text or "").lower()
+                if SERVER_ID.lower() in href or "manage server" in txt or "console" in txt:
+                    a.click()
+                    time.sleep(5)
+                    break
+        except Exception as e:
+            print(f"从 Dashboard 跳转异常: {e}")
+
+    print(f"📄 当前页面: {sb.get_current_url()}")
+    return True
+
+def do_renew(sb):
+    print("\n" + "#" * 30)
+    print("  开始 Host Ship 续期流程")
+    print("#" * 30)
+
+    if not go_to_server(sb):
+        send_tg_message("❌", "进入服务器页面失败")
+        return
+
+    time.sleep(3)
+
+    # 查找续期相关按钮（根据截图：右侧有 Renew / Renew Limit Reached）
+    print("🔄 查找续期按钮...")
+    renew_btn = None
+    candidates = []
+
+    try:
+        for el in sb.find_elements("button, a, div[role='button']"):
+            txt = (el.text or "").strip().lower()
+            if not txt:
+                continue
+            if any(k in txt for k in ["renew", "续期", "renewal", "extend"]):
+                candidates.append((el, txt))
+                print(f"  找到候选按钮: [{txt}]")
+    except Exception as e:
+        print(f"查找按钮异常: {e}")
+
+    for el, txt in candidates:
+        # 优先真正的可点击续期按钮
+        if "limit reached" in txt or "已达上限" in txt or "无法续期" in txt:
+            print(f"ℹ️ 当前显示「{txt}」，可能未到续期窗口")
+            send_tg_message("⏳", "未到续期时间 / 已达上限", txt)
+            sb.save_screenshot("renew_limit.png")
+            return
+        if "renew" in txt or "续期" in txt:
+            renew_btn = el
+            break
+
+    if not renew_btn and candidates:
+        renew_btn = candidates[0][0]
+
+    if not renew_btn:
+        print("❌ 未找到任何续期相关按钮")
+        # 打印右侧面板信息帮助调试
+        try:
+            page = sb.get_page_source() or ""
+            if "renewal" in page.lower() or "renew" in page.lower():
+                print("页面源码中包含 renew 关键字，可能是按钮文本变化")
+        except Exception:
+            pass
+        sb.save_screenshot("no_renew_btn.png")
+        send_tg_message("❌", "未找到续期按钮")
+        return
+
+    print(f"🖱️ 点击续期按钮: {(renew_btn.text or '').strip()}")
+    try:
+        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", renew_btn)
+        time.sleep(0.5)
+        renew_btn.click()
+    except Exception:
+        sb.execute_script("arguments[0].click();", renew_btn)
+
+    time.sleep(5)
+
+    # 可能弹出确认框 / 验证码
+    print("⏳ 检查是否有确认弹窗或验证...")
+    try:
+        # 尝试点击确认类按钮
+        for btn in sb.find_elements("button"):
+            t = (btn.text or "").lower()
+            if any(k in t for k in ["confirm", "yes", "ok", "renew", "确认", "续期"]):
+                print(f"🖱️ 点击确认: {btn.text}")
+                btn.click()
+                time.sleep(3)
+                break
+    except Exception:
+        pass
+
+    # 再次检查 Turnstile（有些面板续期也有盾）
+    if sb.execute_script(_EXISTS_JS):
+        print("检测到续期页 Turnstile，尝试处理...")
+        handle_turnstile(sb)
+        time.sleep(2)
+        try:
+            for btn in sb.find_elements("button"):
+                if "renew" in (btn.text or "").lower():
+                    btn.click()
+                    break
+        except Exception:
+            pass
+
+    time.sleep(6)
+
+    # 结果判断
+    page = (sb.get_page_source() or "").lower()
+    cur_url = sb.get_current_url()
+
+    if any(k in page for k in ["success", "renewed", "extended", "成功", "已续期"]):
+        print("✅ 续期成功！")
+        send_tg_message("✅", "续期成功")
+    elif "limit reached" in page or "无法续期" in page or "not eligible" in page:
+        print("⏳ 未到续期窗口或已达上限")
+        send_tg_message("⏳", "未到续期时间 / 已达上限")
+    else:
+        print("ℹ️ 续期操作已执行，请人工确认结果")
+        send_tg_message("ℹ️", "续期操作已执行，请人工确认", cur_url)
+
+    sb.save_screenshot("renew_result.png")
+
+# ===================== 主入口 =====================
+def main():
+    print("#" * 30)
+    print("   Host Ship 自动登录续期")
+    print("#" * 30)
+
+    if not EMAIL or not PASSWORD:
+        print("❌ 请设置 HOSTSHIP_EMAIL 和 HOSTSHIP_PASSWORD")
+        return
+    if not SERVER_ID:
+        print("❌ 请设置 HOSTSHIP_SERVER_ID（例如 7e97dcac）")
+        return
+
+    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+    sb_kwargs = {"uc": True, "headless": False}
+
+    if IS_PROXY:
+        print(f"🔗 使用代理: {proxy_str}")
+        sb_kwargs["proxy"] = proxy_str
+    else:
+        print("🌐 直连访问")
+
+    print("🚀 启动浏览器...")
+    with SB(**sb_kwargs) as sb:
+        try:
+            sb.open("https://api.ip.sb/ip")
+            print(f"📍 当前出口IP: {sb.get_text('body')}")
+        except Exception:
+            pass
+
+        if login(sb):
+            do_renew(sb)
+        else:
+            print("\n❌ 登录失败，终止续期。")
+            send_tg_message("❌", "登录失败")
 
 if __name__ == "__main__":
     main()
