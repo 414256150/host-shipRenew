@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -619,14 +618,9 @@ def go_to_server(sb) -> bool:
 
         try:
 
-            sb.execute_script(
-                "arguments[0].scrollIntoView("
-                "{block:'center'});",
-                manage_btn
-            )
-
-            time.sleep(0.5)
-
+            # 注意：CDP 模式下 execute_script 不支持 arguments[0]，
+            # 会报 ReferenceError: arguments is not defined。
+            # 直接 click 在 WebDriver / CDP 两种模式下都兼容。
             manage_btn.click()
 
             time.sleep(5)
@@ -878,21 +872,41 @@ def do_renew(sb):
 
     try:
 
-        sb.execute_script(
-            "arguments[0].scrollIntoView("
-            "{block:'center'});",
-            renew_btn
-        )
-
-        time.sleep(0.5)
-
+        # 注意：CDP 模式下 execute_script 不支持 arguments[0]，
+        # 会报 ReferenceError: arguments is not defined。
+        # 直接 click 在 WebDriver / CDP 两种模式下都兼容。
         renew_btn.click()
 
-    except Exception:
+    except Exception as e:
 
+        print(
+            f"⚠️ 直接点击失败: {e}，"
+            f"改用页面内选择器点击..."
+        )
+
+        # CDP 安全写法：不传元素、不用 arguments，
+        # 直接在页面里按文本找到续期按钮再点
         sb.execute_script(
-            "arguments[0].click();",
-            renew_btn
+            """
+            (function() {
+                var els = document.querySelectorAll(
+                    "button, a, div[role='button']"
+                );
+                for (var i = 0; i < els.length; i++) {
+                    var t = (
+                        els[i].textContent || ""
+                    ).trim().toLowerCase();
+                    if (
+                        t.indexOf("renew") !== -1 ||
+                        t.indexOf("续期") !== -1
+                    ) {
+                        els[i].click();
+                        return "clicked";
+                    }
+                }
+                return "not-found";
+            })()
+            """
         )
 
     time.sleep(5)
